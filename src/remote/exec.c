@@ -236,7 +236,9 @@ static void query_service(void) {
     const cal_sweep_state_t state = cal_sweep_state();
 
     if (state == CAL_SWEEP_DONE) {
-        char text[32];
+        /* Three readings of up to 15 characters each plus two separators: 47. A 32-byte line cut the slow
+         * reading off on the meter. */
+        char text[64];
         line_t line = {.text = text, .size = sizeof text, .length = 0u};
 
         if (query_pending == QUERY_STD) {
