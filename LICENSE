@@ -1,0 +1,72 @@
+BK-Precision-5491B-Rewrite License
+
+Copyright (c) 2026 zombu4
+
+This is a source-available license. It is not an open-source license and it
+is not approved by the Open Source Initiative. "The Software" means
+BK-Precision-5491B-Rewrite, including its source code, documentation, test
+data and any firmware image built from them. "The Author" means the copyright
+holder named above.
+
+By downloading, copying, building, flashing or using the Software you accept
+these terms.
+
+1. Use and modification
+
+   Anyone may download, use, study and modify the Software, free of charge,
+   for their own use. Use may be personal, or internal within an organisation,
+   for example to run that organisation's own instruments.
+
+2. Redistribution
+
+   The Software may be redistributed only unmodified, complete, together with
+   this license, and free of charge. Modified versions may be kept and used
+   under paragraph 1 but may not be redistributed.
+
+3. No selling
+
+   Nobody except the Author may sell the Software, a modified version of it,
+   an instrument with the Software installed, or a service or product whose
+   value depends on it.
+
+4. No bundling and no commercial distribution
+
+   Without the Author's prior written permission, the Software may not be
+   bundled with or included in any other product, whether hardware or
+   software, free or paid, and may not be resold or commercially distributed
+   by other companies.
+
+5. Rights retained; contributions
+
+   The Author retains all rights in the Software, including the exclusive
+   right to sell or license it commercially. Anyone who submits a contribution
+   to the Software licenses that contribution to the Author under the same
+   rights, so that it can be included in the official version.
+
+6. No warranty, no liability, flashing at your own risk
+
+   The Software is provided "as is", without warranty of any kind, express or
+   implied, including fitness for a particular purpose, accuracy or
+   non-infringement. Replacing an instrument's firmware can erase its stored
+   calibration, make it unusable until it is reprogrammed, or make it measure
+   wrongly. You flash and use the Software entirely at your own risk. To the
+   maximum extent permitted by law, the Author is not liable for any damage,
+   loss of data, damage to instruments, incorrect measurements or any other
+   claim arising from the Software or its use.
+
+7. Termination
+
+   If you violate any term of this license, the license terminates
+   automatically and you must stop using and distributing the Software.
+
+Third-party components
+
+   Firmware images built from the Software contain parts of AVR-LibC and the
+   GCC runtime library, which are licensed under their own terms. This license
+   covers only the Author's own code. See THIRD_PARTY_NOTICES.md and the
+   LICENSES folder.
+
+Trademarks
+
+   Product names and trademarks mentioned belong to their respective owners.
+   The Software is not affiliated with or endorsed by them.

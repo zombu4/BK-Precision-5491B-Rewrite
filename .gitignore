@@ -1,0 +1,31 @@
+# build output
+build/
+build14/
+dist/
+*.o
+*.d
+*.elf
+*.map
+*.lss
+*.exe
+host/check_fmt.bin
+sim/sim_5491b
+
+# firmware images and dumps (release images are built by CI; dumps are personal)
+*.hex
+*.bin
+!tests/fixtures/eeprom_sanitized.bin
+
+# never in this repository
+reference/
+work/
+mirror/
+.vscode/
+*.zip
+*.pdf
+*.rar
+*.mdb
+*.log
+__pycache__/
+.venv/
+venv/

@@ -1,0 +1,76 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  AVR_GCC_URL: https://github.com/ZakKemble/avr-gcc-build/releases/download/v14.1.0-1/avr-gcc-14.1.0-x64-linux.tar.bz2
+  AVR_GCC_SHA256: 4e9c6edf520765cdefa2d9af3304681296de24c3e095750e3be5504c12d3b224
+  SIMAVR_REPO: https://github.com/buserror/simavr.git
+  SIMAVR_COMMIT: 5b08da60497f7564f50941f74a549fe2851db030
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host packages
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev pkg-config
+
+      - name: Install avr-gcc 14.1.0
+        run: |
+          curl -fsSL -o /tmp/avr-gcc.tar.bz2 "$AVR_GCC_URL"
+          echo "$AVR_GCC_SHA256  /tmp/avr-gcc.tar.bz2" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/avr-gcc"
+          tar -xjf /tmp/avr-gcc.tar.bz2 -C "$RUNNER_TEMP/avr-gcc" --strip-components=1
+          echo "AVR_GCC_BIN=$RUNNER_TEMP/avr-gcc/bin" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/avr-gcc/bin" >> "$GITHUB_PATH"
+
+      - name: Host tests
+        run: python3 -I build.py hosttests
+
+      - name: Build firmware (release)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python3 -I build.py --release image
+
+      - name: Build firmware (development)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: python3 -I build.py image
+
+      - name: Build simavr
+        run: |
+          git clone --quiet "$SIMAVR_REPO" "$RUNNER_TEMP/simavr"
+          git -C "$RUNNER_TEMP/simavr" checkout --quiet "$SIMAVR_COMMIT"
+          make -C "$RUNNER_TEMP/simavr" build-simavr
+          echo "SIMAVR_DIR=$RUNNER_TEMP/simavr/simavr" >> "$GITHUB_ENV"
+
+      - name: Simulator tests
+        run: bash sim/run_sim.sh
+
+      - name: Collect files
+        run: |
+          mkdir -p dist
+          cp build/5491B-rewrite-full.hex build/5491B-rewrite-app.hex build/5491B-rewrite-full.bin build/SHA256SUMS dist/
+          cp LICENSE THIRD_PARTY_NOTICES.md LICENSES/avr-libc-2.2.0-LICENSE.txt dist/
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: dist/
+
+      - name: Draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --title "$GITHUB_REF_NAME" \
+            --notes "Firmware images for the 5491B. Read README.md before flashing: back up your flash, EEPROM and fuses first. SHA256SUMS lists the hash of each image."
