@@ -10,7 +10,7 @@ That is format, not a bug, so it does not change.
 0x861; calibration writes are still persistent the moment they are sent. EEPROM record formats
 and offsets are unchanged, so existing calibration data loads as-is.
 
-Status: `done` = in the written code; `planned` = agreed, not yet written. Status values are as recorded on
+Status: every row was checked against the source on 2026-10-23 ("code audit", with file:line); DONE = implemented, PARTIAL = part implemented, NOT DONE = not implemented. Status values are as recorded on
 2026-10-22 and may lag the code; the source is authoritative.
 
 ## A. New commands
@@ -53,7 +53,7 @@ write**. Still open and ungated: every `:THID` query, `:SCAL:STD`, `:SCAL:STD:AC
 `:SCAL:DCV:ZERO`, `:SCAL:ACV:ZERO`, and all measurement and configuration commands.
 
 **Consequence:** the vendor calibration software can no longer calibrate this
-firmware. Status: done / planned (serv.c).
+firmware. Status: PARTIAL (code audit 2026-10-23): the lock gates the writers listed; `:SCAL:CLEAR_*` are removed instead of protected, and `*FAC`, `*PRO`, `*WSN` are refused outright.
 
 ## C. Bug fixes that change observable behaviour
 
@@ -68,11 +68,11 @@ Every pre-existing bug is fixed. Each row is a behaviour difference a client can
 
 | Area | Vendor behaviour (bug) | New behaviour | Status |
 |---|---|---|---|
-| Number input | A numeric parameter of `0` is rejected | `0` accepted wherever the range allows it | planned |
+| Number input | A numeric parameter of `0` is rejected | `0` accepted wherever the range allows it | DONE (code audit 2026-10-23: src/fmt/fmt.c:37-39,577-582,710-713; src/fmt/fmt.h:19-20; src/remote/parser.c:305-328) |
 | Number input | Root keyword `scalibration` never matches | Accepted | done (remote) |
-| Number input | Out-of-range exponent silently yields a wrong value (`1e39` stored as `1.2e-38`) | A normal error; nothing is stored | planned |
-| Number output | `+` or space printed before a negative number; zero padding before the minus sign | Fixed; the rest of the layout unchanged | planned |
-| Number output | `%e` of 0.0 prints nothing; 1e-5 prints as 9.9e-6 (24-bit fraction) | Correct output | planned |
+| Number input | Out-of-range exponent silently yields a wrong value (`1e39` stored as `1.2e-38`) | A normal error; nothing is stored | DONE (code audit 2026-10-23: src/fmt/fmt.c:689-693,715-718,742-744; src/remote/parser.c:317-319) |
+| Number output | `+` or space printed before a negative number; zero padding before the minus sign | Fixed; the rest of the layout unchanged | DONE (code audit 2026-10-23: src/fmt/fmt.c:380-430,491-493) |
+| Number output | `%e` of 0.0 prints nothing; 1e-5 prints as 9.9e-6 (24-bit fraction) | Correct output | DONE (code audit 2026-10-23: src/fmt/fmt.c:268-276,286-296,515) |
 | `:CALC:LIM:FAIL?` | Answers 1 for *in limits* (inverted) | Answers 1 on FAIL | done (remote) |
 | `:CALC:LIM:UPP\|LOW` | A non-number argument is treated as a query | Error | done (remote) |
 | `:FUNC2 CURR:DC` | On AC+DC current, selects the AC entry | Selects the DC entry | done (remote) |
@@ -84,10 +84,10 @@ Every pre-existing bug is fixed. Each row is a behaviour difference a client can
 | `FETCh?;<cmd>` | Syntax error | Accepted | done (remote) |
 | Trailing blank before end of line | Syntax error | Accepted | done (remote) |
 | `HOLD:WINDow?` | Replies a float built from a 16-bit integer (garbage) | Replies the hold window | done |
-| REVISION / `*IDN?` | REVISION shows the model name and "001"; version text comes from EEPROM 0x830 | REVISION shows our version string; `*IDN?` keeps model `5491B` with our version | planned |
+| REVISION / `*IDN?` | REVISION shows the model name and "001"; version text comes from EEPROM 0x830 | REVISION shows our version string; `*IDN?` keeps model `5491B` with our version | DONE (code audit 2026-10-23: src/serv/thid.c:58,337-357; version.h:25-27; src/ui/menu.c:1135-1149,1361-1362) |
 | Error handling | A command error stalls the CPU about 1 s with interrupts off, losing every byte that arrives | Errors are queued and reported without blocking; no bytes lost | done |
-| Bad arguments | A bad `:SCAL:COEF`, `:SCAL:DATE`, range or NPLC argument still takes effect | Validated first; an error changes nothing | done / planned (cal) |
-| `:SCAL:COEF` | No field-count or range checks; index overflow into neighbouring records | Strict per-function field count and bounds-checked index | planned |
+| Bad arguments | A bad `:SCAL:COEF`, `:SCAL:DATE`, range or NPLC argument still takes effect | Validated first; an error changes nothing | DONE (code audit 2026-10-23: src/cal/cal_ops.c:292-345; src/remote/exec.c:629-665; src/remote/exec.c:546-570) |
+| `:SCAL:COEF` | No field-count or range checks; index overflow into neighbouring records | Strict per-function field count and bounds-checked index | DONE (code audit 2026-10-23: src/cal/cal_ops.c:173-281; src/cal/cal.c:81-185; src/remote/exec.c:560-562) |
 
 ## D. Timing-visible differences
 
@@ -109,12 +109,12 @@ client can observe. The rest are internal and do not belong in this file.
 | Area | Vendor behaviour (bug) | New behaviour | Status |
 |---|---|---|---|
 | `:HOLD:STATe ON` | **Locks the remote port.** With the display enabled, the hold refresh loop (0x0AEB4) services the keyboard (0x0DB4E) but never the command executor (0x0FBEA), which has only two callers. The port stays deaf until a front-panel key is pressed. | Hold redraws once; the main loop keeps running and `remote_poll()` is always reached. | **done** (the port removed the nested loop; verified by cross-reference) |
-| Baud 38400 | The divisor actually yields **39474 baud, +2.8%** | Correct divisor (with the full 12-bit UBRR1H/L fix) | planned |
-| `:CALC:PERCent` ACQuire | Acquiring a percent reference from a **zero** reading divides by zero | Rejected with a data error; no reference stored (#78). Remote `:CALC:KMATh:PERCent:ACQuire` done; the front-panel path is separate | done (remote) / planned |
-| `HOLD:WINDow` / `HOLD:COUNt` (#32) | The values are stored but **never read anywhere in the image**, so hold does nothing but freeze the display, and 0x0E2D is zero at power-on while the menu shows "1%" | Field initialised. Capture rule **APPROVED as proposed**: once HOLD is armed, the reading latches when COUNt consecutive readings stay within WINDow (a fraction of the first reading); then the display freezes and the meter beeps if the beeper is on | planned; APPROVED 2026-10-22 |
-| `:SCAL:CLEAR_REL` | **A no-op.** Nothing reads the signature at EEPROM 0x894, and the OHM user zero has no signature at all | Clears what it claims to clear | planned |
-| `:SCAL:CLEAR_DATA` | Stamps only 19 signature sets; the sweep-written AC zero records at 0x0C38 and 0x0C80 **survive a clear** | Clears every calibration record it names | planned |
-| `:SCAL:COEF` | The existing valid signature stays in place while the data underneath is rewritten, so a power loss leaves a record **marked valid over half-old, half-new data** | Signature invalidated first, then data written and verified, then revalidated | planned |
+| Baud 38400 | The divisor actually yields **39474 baud, +2.8%** | Correct divisor (with the full 12-bit UBRR1H/L fix) | DONE (code audit 2026-10-23: src/hal/uart1.c:411-426) |
+| `:CALC:PERCent` ACQuire | Acquiring a percent reference from a **zero** reading divides by zero | Rejected with a data error; no reference stored (#78). Remote `:CALC:KMATh:PERCent:ACQuire` done; the front-panel path is separate | DONE (code audit 2026-10-23: src/remote/handlers.c:1403-1411; src/ui/menu.c:1588,1612) |
+| `HOLD:WINDow` / `HOLD:COUNt` (#32) | The values are stored but **never read anywhere in the image**, so hold does nothing but freeze the display, and 0x0E2D is zero at power-on while the menu shows "1%" | Field initialised. Capture rule **APPROVED as proposed**: once HOLD is armed, the reading latches when COUNt consecutive readings stay within WINDow (a fraction of the first reading); then the display freezes and the meter beeps if the beeper is on | DONE (code audit 2026-10-23: src/meas/meas.c:1289-1333,2197,2353-2356; main.c:237-238; src/remote/handlers.c:761-773,781-796,805-809) |
+| `:SCAL:CLEAR_REL` | **A no-op.** Nothing reads the signature at EEPROM 0x894, and the OHM user zero has no signature at all | Clears what it claims to clear | NOT DONE (code audit 2026-10-23: src/remote/exec.c:244-247,790-791; src/cal/cal.h:419-422) |
+| `:SCAL:CLEAR_DATA` | Stamps only 19 signature sets; the sweep-written AC zero records at 0x0C38 and 0x0C80 **survive a clear** | Clears every calibration record it names | NOT DONE (code audit 2026-10-23: src/remote/exec.c:244-247,790-791; src/cal/cal.h:419-422) |
+| `:SCAL:COEF` | The existing valid signature stays in place while the data underneath is rewritten, so a power loss leaves a record **marked valid over half-old, half-new data** | Signature invalidated first, then data written and verified, then revalidated | DONE (code audit 2026-10-23: src/cal/cal.c:243-263; src/cal/cal.c:287-302; src/cal/cal_ops.c:336-343) |
 | `:SCAL:STD` (#55) | Prints the same medium-rate reading three times in the `%.8e:%.8E,%.8E` reply | **APPROVED:** measures at fast, medium and slow and prints them in the field order **medium, fast, slow**: the number before the colon is the MEDIUM reading, field 2 the fast one, field 3 the slow one, which is how the vendor utility parses the reply (ReadStd @51e36c, the 5492B source does the same). Layout unchanged; the command takes longer, so a client needs a longer timeout | done (remote, exec.c); APPROVED 2026-10-22, including the field order |
 | `:DIODe` | An error stub with an orphan range table | BLOCKED-ON-HARDWARE: needs the diode test current scoped before it can be implemented | blocked |
 
@@ -128,88 +128,88 @@ and a blown current fuse reads as zero current.
 
 ## G. Full ORIGINAL_BUGS review (2026-10-22): remaining client-visible changes
 
-Every row below is keyed by its ORIGINAL_BUGS number. All are planned unless stated. Reply layouts stay as in the vendor firmware.
+Every row below is keyed by its ORIGINAL_BUGS number. Reply layouts stay as in the vendor firmware.
 
 ### G.1 Serial link and line handling
 
 | Area | Vendor behaviour (bug) | New behaviour | Status |
 |---|---|---|---|
-| Early next command (#3) | Bytes received while a line is still pending are dropped silently | RX ring buffer; if it overflows the whole line is discarded and an error is queued | planned |
-| Line errors (#4) | Framing, overrun and parity errors are accepted as data | The frame is dropped and an error is queued; no garbled command runs | planned |
-| Empty lines, CR LF (#6) | A bare CR or LF, or the LF of CR LF, runs an empty command and lights REM | Empty lines are ignored; CR LF is one terminator; REM lights only for a non-empty command | planned |
-| Overlong line (#7) | At 255 bytes the line is truncated and the truncated text executes (a cut `:SCAL:COEF` or `:SCAL:DATE` would run) | The whole line is discarded, an error is queued, nothing executes | planned |
+| Early next command (#3) | Bytes received while a line is still pending are dropped silently | RX ring buffer; if it overflows the whole line is discarded and an error is queued | DONE (code audit 2026-10-23: src/hal/uart1.c:233-272; src/hal/uart1.c:323-376; src/remote/exec.c:953-955) |
+| Line errors (#4) | Framing, overrun and parity errors are accepted as data | The frame is dropped and an error is queued; no garbled command runs | DONE (code audit 2026-10-23: src/hal/uart1.c:236-246; src/remote/exec.c:956-958) |
+| Empty lines, CR LF (#6) | A bare CR or LF, or the LF of CR LF, runs an empty command and lights REM | Empty lines are ignored; CR LF is one terminator; REM lights only for a non-empty command | DONE (code audit 2026-10-23: src/hal/uart1.c:344-363,377-381) |
+| Overlong line (#7) | At 255 bytes the line is truncated and the truncated text executes (a cut `:SCAL:COEF` or `:SCAL:DATE` would run) | The whole line is discarded, an error is queued, nothing executes | DONE (code audit 2026-10-23: src/hal/uart1.c:364-375; src/remote/exec.c:995-1000) |
 | Reply pacing (#8) | A 1 ms pause follows every reply character; a long `%.8e` reply blocks the meter for 15 ms or more and baud rates above 9600 are throttled | KEPT, decided in section I ("Reply pacing"): the 1 ms pause per reply character stays. Replacing it with a TX buffer was planned here and is withdrawn; this row is superseded by section I | kept (see I) |
-| Baud 2400/1200/600 (#89) | Only the low divisor byte is used: the real rates are about 13393, 6637 and 3318 baud | Full 12-bit divisor; the rates are the nominal ones | planned |
+| Baud 2400/1200/600 (#89) | Only the low divisor byte is used: the real rates are about 13393, 6637 and 3318 baud | Full 12-bit divisor; the rates are the nominal ones | DONE (code audit 2026-10-23: src/hal/uart1.c:411-426) |
 | Statement limit (#23) | No limit on `;`-chained commands in one line; each level uses stack | Not needed: the executor is a loop over the statements of one line (exec.c remote_execute_line), not a recursion, so a chain uses no stack per statement, and a line is bounded at 255 characters by the receive path | not needed (remote) |
-| Lock-ups and traps (#72, #94, #95) | No watchdog, so any lock-up is permanent; a spurious interrupt runs into an unrelated ISR; stack overflow is never detected | A watchdog and a trap-to-reset for spurious vectors and stack overflow: after such a fault the meter restarts (the client sees a reset to power-up state) instead of hanging | planned |
-| Command delays (#93) | Beeps, key waits, the lamp test, "SAVED" and the 1/2/3/5 s sweep settles are CPU busy-waits that starve the UART and measurement | Tick-based timers; the meter keeps receiving and measuring during them. The sweep settle times themselves are unchanged | planned |
+| Lock-ups and traps (#72, #94, #95) | No watchdog, so any lock-up is permanent; a spurious interrupt runs into an unrelated ISR; stack overflow is never detected | A watchdog and a trap-to-reset for spurious vectors and stack overflow: after such a fault the meter restarts (the client sees a reset to power-up state) instead of hanging | PARTIAL (code audit 2026-10-23: src/main.c:389,392 , wdt_reset in the loop); main.c:329-334 |
+| Command delays (#93) | Beeps, key waits, the lamp test, "SAVED" and the 1/2/3/5 s sweep settles are CPU busy-waits that starve the UART and measurement | Tick-based timers; the meter keeps receiving and measuring during them. The sweep settle times themselves are unchanged | PARTIAL (code audit 2026-10-23: src/ui/menu.c:78 and menu_tick; main.c:129-135,459-497; src/hal/buzzer.c) |
 
 ### G.2 Parsing and arguments
 
 | Area | Vendor behaviour (bug) | New behaviour | Status |
 |---|---|---|---|
-| Overlong numeric token (#16) | 20 or more characters raise an error and are still copied into a 20-byte buffer (stack overflow) | Length check first; error and no copy | planned |
-| Unterminated quote (#17) | Syntax error, but the next token is read from stale buffer bytes | Syntax error, no token, the line ends | planned |
-| Character that starts no token (#18) | Characters such as `+`, `.`, `#`, control codes and bytes of 0x80 and above are not consumed; only the error flag stops a loop | Always consumed or the line ends; one syntax error | planned |
-| Number scanning (#21) | Trailing junk is ignored (`12abc` = 12, `1,5` = 1); `1e` and `1e+` are accepted as exponent 0; results are 1-3 ulp low; a leading blank fails | Round to nearest; trailing junk, empty exponent and an out-of-range exponent are errors (unit suffixes only where the range table lists them) | planned |
-| Integer arguments (#22) | Wrap at 16 bits (`99999` = 34463); `5.7` becomes 5 for `HOLD:COUNt`; `+` and blanks not accepted | Range-checked; overflow and a fractional value are errors | planned |
+| Overlong numeric token (#16) | 20 or more characters raise an error and are still copied into a 20-byte buffer (stack overflow) | Length check first; error and no copy | DONE (code audit 2026-10-23: src/remote/parser.c:141-158; src/fmt/fmt.c:624-626,645-647) |
+| Unterminated quote (#17) | Syntax error, but the next token is read from stale buffer bytes | Syntax error, no token, the line ends | DONE (code audit 2026-10-23: src/remote/parser.c:161-178; src/remote/reply.c:79-86) |
+| Character that starts no token (#18) | Characters such as `+`, `.`, `#`, control codes and bytes of 0x80 and above are not consumed; only the error flag stops a loop | Always consumed or the line ends; one syntax error | DONE (code audit 2026-10-23: src/remote/parser.c:227,254-259; src/remote/exec.c:863-892; src/remote/reply.c:79-86) |
+| Number scanning (#21) | Trailing junk is ignored (`12abc` = 12, `1,5` = 1); `1e` and `1e+` are accepted as exponent 0; results are 1-3 ulp low; a leading blank fails | Round to nearest; trailing junk, empty exponent and an out-of-range exponent are errors (unit suffixes only where the range table lists them) | PARTIAL (code audit 2026-10-23: src/remote/parser.c:298-314; src/fmt/fmt.c:683-688; src/fmt/fmt.c:47-52) |
+| Integer arguments (#22) | Wrap at 16 bits (`99999` = 34463); `5.7` becomes 5 for `HOLD:COUNt`; `+` and blanks not accepted | Range-checked; overflow and a fractional value are errors | DONE (code audit 2026-10-23: src/fmt/fmt.c:547-591; src/remote/parser.c:351-361; src/remote/handlers.c:786-791,1139-1145,1288-1294) |
 | Node selects the function (#25) | `:AC`, `:DC`, `:ACDC` (and VOLT/CURR/RES) are ignored; every command edits the ACTIVE function, so `VOLT:DC:RANGe 5` in a current function changes the current range | The named node selects the function whose RANGe/REFerence state is edited (`VOLT:DC`, `VOLT:AC`, `VOLT:ACDC`, `CURR:...`, `RES`, and the FREQ and PER roots for their own functions). The hardware is touched only if that function is active. `REFerence:ACQuire` of a function that is not active is a cannot-execute error, because the last reading belongs to the active function | done (remote) |
 | Keyword parents (#26) | AUTO, UPPer, STATe and ACQuire are accepted under both RANGe and REFerence; `VOLT:DC:RANGe:STATe ON` switches REL on | AUTO and UPPer are accepted only under RANGe; STATe and ACQuire only under REFerence (for FREQ and PER: VOLTage only under THReshold, STATe and ACQuire only under REFerence); elsewhere a syntax error | done (remote) |
 | Threshold range arguments (#28) | `FREQ`/`PER` `:THReshold:VOLTage:RANGe` takes only numbers | DEF, MIN and MAX are accepted, as for VOLT/CURR/RES | done (remote) |
-| `CURR:ACDC:RANGe:UPPer?` (#29) | Reply truncated (`0.05` becomes `0`). The `VOLT:ACDC:RANGe?` fix in section C is the same defect | Full spelling of the selected entry | planned |
+| `CURR:ACDC:RANGe:UPPer?` (#29) | Reply truncated (`0.05` becomes `0`). The `VOLT:ACDC:RANGe?` fix in section C is the same defect | Full spelling of the selected entry | DONE (code audit 2026-10-23: src/remote/tree.c:114-129,159-179) |
 | `:FUNC?` on AC+DC (#30) | Reads past the name table | Correct name for all 11 functions: `volt:acdc` and `curr:acdc` for the last two | done (remote) |
 | `FETC?` count (#40) | Two `FETC?` before the next conversion give one reply | Each `FETC?` gets its own reply, one per conversion (up to 255 outstanding; a request beyond that is a cannot-execute error). Each reply is sent when the next reading completes (ordering in main.c) | done (remote) |
 | Tiny values (#41) | `FETC?`, `REF?` and `FREQ:REF?` print `0.000` below 1e-7 (a 20 MHz period of 5e-8 s; currents under 100 nA) | The true value in the unchanged `%.8e` layout; an exact zero prints `0.0e0` like every other zero in a reply (section H), where the original printed `0.000` | done (remote) |
 | `:SYSTem:BEEPer` (#42) | Writes the key-click setting, not the beeper of menu BEEP STA (error, limit, hold) | `:SYST:BEEPer` controls the BEEP STA beeper. **Proposed new command `:SYSTem:KCLick ON\|OFF` (and `?`)** for key click, stored where the old BEEPer value was (EEPROM 0x855). A client that used BEEPer for key click must switch to KCLick | APPROVED 2026-10-22; see section A |
-| `:SCAL:STD?` (#43) | No reply and no error, so the host waits forever | A normal error (the command is not a query) | planned |
-| `*IDN?` version (#12) | The version text is read from EEPROM 0x830, not from the running firmware (the repaired unit shows Ver1.4.14.06.18 only because that EEPROM text was edited) | The version is a firmware constant; EEPROM 0x830 is no longer used (an edit of it has no effect) | planned |
-| Identity fields (#13) | `*PRO`, `*WSN` and `THID` serial writes copy a fixed block including stale bytes after the NUL; an over-long token is cut silently | Zero-padded fields; a too-long argument is rejected with an error before any write | planned |
-| `*IDN?` join (#14) | UNVERIFIED: three EEPROM blocks are joined without a bound, so a field with no NUL could run on | Every block copy and the join are bounded; a reply never overruns | planned; UNVERIFIED |
+| `:SCAL:STD?` (#43) | No reply and no error, so the host waits forever | A normal error (the command is not a query) | DONE (code audit 2026-10-23: src/remote/exec.c:319-343) |
+| `*IDN?` version (#12) | The version text is read from EEPROM 0x830, not from the running firmware (the repaired unit shows Ver1.4.14.06.18 only because that EEPROM text was edited) | The version is a firmware constant; EEPROM 0x830 is no longer used (an edit of it has no effect) | DONE (code audit 2026-10-23: src/serv/thid.c:58,348-353; eeprom_map.h:120) |
+| Identity fields (#13) | `*PRO`, `*WSN` and `THID` serial writes copy a fixed block including stale bytes after the NUL; an over-long token is cut silently | Zero-padded fields; a too-long argument is rejected with an error before any write | DONE (code audit 2026-10-23: src/serv/thid.c:227-250; src/serv/thid.c:381-382) |
+| `*IDN?` join (#14) | UNVERIFIED: three EEPROM blocks are joined without a bound, so a field with no NUL could run on | Every block copy and the join are bounded; a reply never overruns | DONE (code audit 2026-10-23: src/serv/thid.c:278-357) |
 
 ### G.3 Errors and calibration commands
 
 | Area | Vendor behaviour (bug) | New behaviour | Status |
 |---|---|---|---|
 | Error queue (#10) | Only the last error is kept; `:SYST:ERR?` returns and clears it | 8-deep queue; `:SYST:ERR?` pops the oldest; `NO ERROR!` when empty. A ninth error while eight are queued is dropped, so the eight kept are the first eight | done (remote) |
-| `:SCAL:COEF` non-string (#47) | A non-string argument raises an error and the parser still writes EEPROM | Return after the error; nothing written | planned |
-| EEPROM write check (#50) | No read-back; an interrupt in the write window can drop a byte | Writes are read back and compared; a mismatch is an error reply to the command | planned |
-| `:SCAL:SHOR:ONCE`, `:SCAL:OPEN:ONCE` (#52) | No function guard: other functions write the ACV/ACA zero area; the range index can be out of range | A function and range guard; a mismatch is an error and nothing is written | planned |
-| After `:SCAL:SHOR`/`OPEN` sweeps (#53) | The function is left at VDC and every swept range index is left past the last valid value | The saved function and range indices are restored | planned |
-| `:SCAL:ACV:ZERO`, `:SCAL:DCV:ZERO` (#54) | Use an uninitialised base address outside their functions; change and restore the rate during the query | Function guard (error outside the function); the rate is not touched | planned |
-| `:SCAL:TEST` (#56) | For functions 5-10 no measurement is taken; the reply carries the previous value | A real measurement is taken, or an error | planned |
-| `:SCAL:DATE` (#57) | Writes 8 bytes even if a character failed validation or the text is shorter than 8 | Validated first; exactly the validated text is written, padded; an invalid date is an error and changes nothing | planned |
-| `THID` counts (#61, #62) | Counts are printed with only their first two characters (100 and above cut); INCR/DECR have no bounds, so DECR from 0 gives 65535 | The full number is sent; counts clamp at 0 and 65535 with an error | planned |
-| `THID` writes (#63) | Date and member validation errors do not stop the write; a production-date write after the lock is ignored with no error | Validate, then write; a locked write is an error | planned |
+| `:SCAL:COEF` non-string (#47) | A non-string argument raises an error and the parser still writes EEPROM | Return after the error; nothing written | DONE (code audit 2026-10-23: src/remote/exec.c:604-615) |
+| EEPROM write check (#50) | No read-back; an interrupt in the write window can drop a byte | Writes are read back and compared; a mismatch is an error reply to the command | DONE (code audit 2026-10-23: src/hal/eeprom.c:60-81; src/remote/exec.c:672-674,660-662) |
+| `:SCAL:SHOR:ONCE`, `:SCAL:OPEN:ONCE` (#52) | No function guard: other functions write the ACV/ACA zero area; the range index can be out of range | A function and range guard; a mismatch is an error and nothing is written | DONE (code audit 2026-10-23: src/cal/cal_ops.c:377-391,686-688; src/remote/exec.c:187-191) |
+| After `:SCAL:SHOR`/`OPEN` sweeps (#53) | The function is left at VDC and every swept range index is left past the last valid value | The saved function and range indices are restored | DONE (code audit 2026-10-23: src/cal/cal_ops.c:473-489,564-571) |
+| `:SCAL:ACV:ZERO`, `:SCAL:DCV:ZERO` (#54) | Use an uninitialised base address outside their functions; change and restore the rate during the query | Function guard (error outside the function); the rate is not touched | DONE (code audit 2026-10-23: src/remote/exec.c:389-414; src/cal/cal_ops.c:982-1017) |
+| `:SCAL:TEST` (#56) | For functions 5-10 no measurement is taken; the reply carries the previous value | A real measurement is taken, or an error | DONE (code audit 2026-10-23: src/cal/cal_ops.c:940-969; src/remote/exec.c:358-373) |
+| `:SCAL:DATE` (#57) | Writes 8 bytes even if a character failed validation or the text is shorter than 8 | Validated first; exactly the validated text is written, padded; an invalid date is an error and changes nothing | DONE (code audit 2026-10-23: src/remote/exec.c:629-665; src/cal/cal_ops.c:1023-1037) |
+| `THID` counts (#61, #62) | Counts are printed with only their first two characters (100 and above cut); INCR/DECR have no bounds, so DECR from 0 gives 65535 | The full number is sent; counts clamp at 0 and 65535 with an error | DONE (code audit 2026-10-23: src/serv/thid.c:150-178) |
+| `THID` writes (#63) | Date and member validation errors do not stop the write; a production-date write after the lock is ignored with no error | Validate, then write; a locked write is an error | DONE (code audit 2026-10-23: src/serv/thid.c:110-137,181-204,227-244) |
 
 ### G.4 Measurement, readings and frequency
 
 | Area | Vendor behaviour (bug) | New behaviour | Status |
 |---|---|---|---|
-| ZERO CAL capture (#65, #104) | The first conversion (possibly stale) is kept, the value is stored with no limit or read-back, and the sweep sets PA5 on every DCV range | The first conversion is discarded; a zero above the dead-band threshold is refused and the old table kept; read-back verify; the capture runs in the normal DCV PA5 state (PA5 = 0). #104 is FIXED-BY-DESIGN | planned |
-| DC V negative readings (#66, #67) | The negative gain pair is overwritten by the positive pair for the primary path; the secondary path (ACV dual display) uses the cleared negative record with gain 1.0, so negative DC V reads about 2.4% short | Negative pair used only when its signature is valid, else the positive pair, on both paths | planned |
-| Zero-valued coefficients (#68) | A valid-signature pair (0.0, 0.0) makes the range read 0 | A zero or non-finite coefficient is treated as invalid and the identity is used | planned |
-| ACV secondary DC user zero (#69) | The user-zero array is loaded only by the DCV loader, so the secondary DC path uses stale values when DCV was never selected | The ACV loader loads the DC user zeros when the secondary DC path is active | planned |
-| Autorange (#70) | No iteration limit; an input on a threshold can alternate ranges forever | At most 2 x the number of ranges per pass, then the last range is held | planned |
-| Converter timeout (#71) | /DRDY is polled with no timeout; a missing converter hangs the meter | Bounded wait; the reading is invalid and an error is queued | planned |
-| Frequency scale (#73) | Timer overflow counts weighted 65535 instead of 65536 (15 ppm) | 65536 | planned |
-| Frequency timeout (#74) | The wait for the last edge ends after 3000 loop passes, so a slow signal can time out and read 0 | Time-based timeout of the gate time plus two signal periods | planned |
-| Period of zero frequency (#75) | 1/f with no guard returns +FLT_MAX | An explicit no-signal reading | planned |
-| Frequency capture race (#76) | A capture arriving with the overflow flag pending is stamped one overflow wrong (up to 1.1% of a 0.5 s gate) | The pending overflow is counted first | planned |
-| Zero frequency display (#77) | Exact 0 Hz keeps the milli prefix | Base unit (display text) | planned |
-| AC+DC low-range correction (#79) | UNVERIFIED: a negative AC+DC value may be forced to 0.0 on functions 9 and 10 | Compare the magnitude | planned; UNVERIFIED |
-| Number output, rounding and errors (#85) | A carry in `%e` leaves `e-0`; a left-justified `%e` is one character short; some tiny and huge values emit the text `ftoa error: ...` into the reply | Correct rounding, exponent and width; never error text in a reply | planned |
-| Float arithmetic (#86) | Results are 1-3 ulp low; overflow returns odd constants (`0x007FFFFF`, -1.17549e-38, +FLT_MAX for division by 0); no NaN/Inf; add clamps at 1.7e38 | IEEE binary32 round-to-nearest with saturating or flagged overflow; last-digit differences in readings are expected | planned |
-| dB, dBm and power math (#87) | `pow`, `log10` and `sqrt` carry errors (`pow(10,2)` = 99.9999, `log10(10)` = 0.9999998) that reach dB/dBm results and displayed digits | Exact or table-based replacements with a stated error bound | planned |
-| 32-bit divide (#88) | Loses a carry for divisors of 2^31 and above | Correct divide | planned |
+| ZERO CAL capture (#65, #104) | The first conversion (possibly stale) is kept, the value is stored with no limit or read-back, and the sweep sets PA5 on every DCV range | The first conversion is discarded; a zero above the dead-band threshold is refused and the old table kept; read-back verify; the capture runs in the normal DCV PA5 state (PA5 = 0). #104 is FIXED-BY-DESIGN | DONE (code audit 2026-10-23: src/meas/meas.c:2422-2431,2442-2493; src/meas/meas.c:549-565; src/ui/menu.c:2181-2196) |
+| DC V negative readings (#66, #67) | The negative gain pair is overwritten by the positive pair for the primary path; the secondary path (ACV dual display) uses the cleared negative record with gain 1.0, so negative DC V reads about 2.4% short | Negative pair used only when its signature is valid, else the positive pair, on both paths | DONE (code audit 2026-10-23: src/cal/cal.c:428-442; src/meas/meas.c:1029,1508,1771-1773) |
+| Zero-valued coefficients (#68) | A valid-signature pair (0.0, 0.0) makes the range read 0 | A zero or non-finite coefficient is treated as invalid and the identity is used | NOT DONE (code audit 2026-10-23: src/cal/cal.c:224-227,349-367) |
+| ACV secondary DC user zero (#69) | The user-zero array is loaded only by the DCV loader, so the secondary DC path uses stale values when DCV was never selected | The ACV loader loads the DC user zeros when the secondary DC path is active | DONE (code audit 2026-10-23: src/cal/cal.c:467-470; src/cal/cal.c:556-559; src/meas/meas.c:1508,1771-1773) |
+| Autorange (#70) | No iteration limit; an input on a threshold can alternate ranges forever | At most 2 x the number of ranges per pass, then the last range is held | DONE (code audit 2026-10-23: src/meas/meas.c:148-149,1647,1721-1730) |
+| Converter timeout (#71) | /DRDY is polled with no timeout; a missing converter hangs the meter | Bounded wait; the reading is invalid and an error is queued | DONE (code audit 2026-10-23: src/hal/adcbus.c:200-208; src/hal/adcbus.h:16; src/meas/meas.c:898-925,1700-1704) |
+| Frequency scale (#73) | Timer overflow counts weighted 65535 instead of 65536 (15 ppm) | 65536 | DONE (code audit 2026-10-23: src/hal/freq.h:12; src/hal/freq.c:314-316) |
+| Frequency timeout (#74) | The wait for the last edge ends after 3000 loop passes, so a slow signal can time out and read 0 | Time-based timeout of the gate time plus two signal periods | PARTIAL (code audit 2026-10-23: src/hal/freq.c:256-262,289-295; src/hal/freq.h:13; src/meas/meas.c:1826-1840) |
+| Period of zero frequency (#75) | 1/f with no guard returns +FLT_MAX | An explicit no-signal reading | DONE (code audit 2026-10-23: src/hal/freq.c:341-351; src/meas/meas.c:171-172,1857-1862) |
+| Frequency capture race (#76) | A capture arriving with the overflow flag pending is stamped one overflow wrong (up to 1.1% of a 0.5 s gate) | The pending overflow is counted first | DONE (code audit 2026-10-23: src/hal/freq.c:182-196) |
+| Zero frequency display (#77) | Exact 0 Hz keeps the milli prefix | Base unit (display text) | DONE (code audit 2026-10-23: src/ui/display.c:298-312) |
+| AC+DC low-range correction (#79) | UNVERIFIED: a negative AC+DC value may be forced to 0.0 on functions 9 and 10 | Compare the magnitude | NOT ESTABLISHED (code audit 2026-10-23: src/cal/cal.c:567-573; src/cal/cal.c:550-600; src/meas/meas.c:1779-1787) |
+| Number output, rounding and errors (#85) | A carry in `%e` leaves `e-0`; a left-justified `%e` is one character short; some tiny and huge values emit the text `ftoa error: ...` into the reply | Correct rounding, exponent and width; never error text in a reply | DONE (code audit 2026-10-23: src/fmt/fmt.c:312-327 , 324-326 and 480-522 , 380-447 , 21-31) |
+| Float arithmetic (#86) | Results are 1-3 ulp low; overflow returns odd constants (`0x007FFFFF`, -1.17549e-38, +FLT_MAX for division by 0); no NaN/Inf; add clamps at 1.7e38 | IEEE binary32 round-to-nearest with saturating or flagged overflow; last-digit differences in readings are expected | NOT ESTABLISHED (code audit 2026-10-23: src/fmt/fmt.c:204-221; fmathf.h:1-60) |
+| dB, dBm and power math (#87) | `pow`, `log10` and `sqrt` carry errors (`pow(10,2)` = 99.9999, `log10(10)` = 0.9999998) that reach dB/dBm results and displayed digits | Exact or table-based replacements with a stated error bound | PARTIAL (code audit 2026-10-23: src/fmt/fmt.c:332-348; src/meas/meas.c:1179,1192 , 1787; src/hal/keys.c:263-277) |
+| 32-bit divide (#88) | Loses a carry for divisors of 2^31 and above | Correct divide | NOT ESTABLISHED (code audit 2026-10-23) |
 | Relay settle time (#102) | Settling is counted in ADC conversions (5 or 3), so it is shortest at the fast rate | Time-based settle: the larger of the conversion count and a measured relay time. BLOCKED-ON-HARDWARE (scope /DRDY and step a known input); until then the original counts apply. Same open question as section E | blocked |
 
 ### G.5 Boot loader (XMODEM download over the serial port)
 
 | Area | Vendor behaviour (bug) | New behaviour | Status |
 |---|---|---|---|
-| Download limits (#96, #97, #99) | No address limit (an image over 0x1F800 bytes overwrites the loader); no image check or verify; a partial last page is padded with stale data | Never writes at or above 0x1F800; read-back verify; whole-image CRC and a valid reset vector are checked before jumping to the application; the last page is padded with 0xFF | planned |
-| XMODEM receive (#98) | No timeout after the first SOH; after a NAK one byte is discarded and the rest is mis-parsed | A per-byte and per-block timeout; resynchronises on SOH | planned |
-| Boot link (#100) | 2 stop bits at 39474 baud (+2.8%); a banner "Type d download" that does not match the real trigger; debug echoes `o`, `@`, `n` | 1 stop bit at 38461 baud (U2X); banner text matching the real trigger (both arrow keys at power-up, then ENTER); no debug echoes. A downloader should use 38400 baud | planned |
+| Download limits (#96, #97, #99) | No address limit (an image over 0x1F800 bytes overwrites the loader); no image check or verify; a partial last page is padded with stale data | Never writes at or above 0x1F800; read-back verify; whole-image CRC and a valid reset vector are checked before jumping to the application; the last page is padded with 0xFF | PARTIAL (code audit 2026-10-23: src/boot/boot.c:343-364 , 474-476 , 431-435,500-502 , 469,485,572-578) |
+| XMODEM receive (#98) | No timeout after the first SOH; after a NAK one byte is discarded and the rest is mis-parsed | A per-byte and per-block timeout; resynchronises on SOH | DONE (code audit 2026-10-23: src/boot/boot.c:183-194,385-392,399-429,441-454,178-181) |
+| Boot link (#100) | 2 stop bits at 39474 baud (+2.8%); a banner "Type d download" that does not match the real trigger; debug echoes `o`, `@`, `n` | 1 stop bit at 38461 baud (U2X); banner text matching the real trigger (both arrow keys at power-up, then ENTER); no debug echoes. A downloader should use 38400 baud | PARTIAL (code audit 2026-10-23: src/boot/boot.c:70-71,128-131; src/boot/boot.c:266,270,273; src/boot/boot.c:106) |
 
 ### G.6 Rows not added in section G
 
