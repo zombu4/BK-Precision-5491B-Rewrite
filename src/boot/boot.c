@@ -2,7 +2,7 @@
  * boot.c - BK 5491B boot loader (separate program in the boot section, 0x1F800 and up).
  *
  * Behaviour (ported from the original loader):
- *   - Initialise UART1 (38400 nominal, 8 data bits, 2 stop bits, no parity), Timer0 (one tick every
+ *   - Initialise UART1 (38400 nominal, 8 data bits, 1 stop bit, no parity), Timer0 (one tick every
  *     20.05 ms) and the front-panel display controller, then read one key-scan byte.
  *   - Unless that byte is 0x03 (both horizontal arrow keys held) start the application at once.
  *   - With the arrow keys held, print a banner and wait about 4 s for ENTER. ENTER starts an
@@ -25,6 +25,14 @@
  *      consumed completely before it is rejected with NAK. Too many NAKs end the transfer.
  *   5. The banner no longer claims a 'd' command: the code never read the serial line, the real trigger
  *      is the ENTER key, so the banner now says so. (The serial 'd' command was not implemented.)
+ *   7. A TRUNCATED IMAGE IS NEVER STARTED. XMODEM carries no length and an early EOT is a legal end of
+ *      transfer, so a host that died mid-file, or a short file, passed every per-frame and per-page check
+ *      above and was started. The image sent is now the application, 0xFF-padded to whole frames, plus one
+ *      trailer frame (magic "BK", length, CRC16). The loader holds each frame back by one, so at EOT the
+ *      frame in hand is the trailer and is never written. The CRC is computed over the flash contents
+ *      after the last page is written, and EE_BOOT_XFER is cleared only if it matches (PROTOCOL_CHANGES G.5).
+ *   6. UART1 runs at 38461.5 baud (double speed, UBRR1 = 38) with 1 stop bit, like the application. The
+ *      original's 39474 baud was +2.8 % off 38400, and it echoed 'o', '@' and 'n' for each key it saw.
  */
 
 #include <avr/boot.h>
@@ -51,8 +59,10 @@ _Static_assert(SPM_PAGESIZE == PAGE_BYTES, "flash page size");
 _Static_assert(BOOT_START % PAGE_BYTES == 0, "boot section is page aligned");
 _Static_assert(PAGE_BYTES % FRAME_BYTES == 0, "frames tile a page");
 
-/* UART1: UBRR1 = 18 gives 39 474 baud at 12 MHz (+2.8 % on 38400), exactly as the original. */
-#define UBRR1_VALUE 18U
+/* UART1 in double-speed mode: baud = 12 000 000 / (8 * (UBRR1 + 1)). UBRR1 = 38 gives 12e6 / 312 =
+ * 38 461.5 baud, +0.16 % on 38400 (ATmega128 doc2467, USART baud rate equation for U2X = 1). The
+ * original's UBRR1 = 18 with U2X = 0 gave 12e6 / (16 * 19) = 39 474 baud, +2.8 %. */
+#define UBRR1_VALUE 38U
 
 /* Timer0 in CTC mode, OCR0 = 234, prescaler 1024: one OCF0 tick every 20.05 ms. */
 #define TIMER0_COMPARE 0xEAU
@@ -96,6 +106,7 @@ typedef enum {
     XFER_ERR_LIMIT = 'L',   /* image would reach the boot section */
     XFER_ERR_IMAGE = 'I',   /* first block is not a plausible application reset vector */
     XFER_ERR_VERIFY = 'V',  /* page read-back differs from what was written */
+    XFER_ERR_CRC = 'C',     /* whole-image CRC in flash differs from the trailer's */
     XFER_ERR_RETRY = 'T'    /* host silent or too many rejected frames */
 } xfer_status_t;
 
@@ -107,14 +118,24 @@ static const char banner[] = "Press ENTER to download, others run app.\n\r";
 
 static uint8_t page_buf[PAGE_BYTES];
 
+/* The most recent accepted frame, not yet appended to page_buf. Holding one frame back is what lets the
+ * loader recognise the trailer at EOT without ever having written it to flash. */
+static uint8_t hold_buf[FRAME_BYTES];
+
+/* Trailer frame: [0] 0x42, [1] 0x4B, [2..5] application length (uint32, little-endian), [6..7] CRC16 of
+ * the application bytes (big-endian, the same order as the frame CRC), [8..127] 0xFF. */
+#define TRAILER_MAGIC_0 0x42U
+#define TRAILER_MAGIC_1 0x4BU
+
 /* ------------------------------------------------------------------------------------------------ */
 /* UART1                                                                                            */
 
 static void uart_init(void) {
     UBRR1H = 0;
     UBRR1L = UBRR1_VALUE;
+    UCSR1A = _BV(U2X1);
     UCSR1B = _BV(RXEN1) | _BV(TXEN1);
-    UCSR1C = _BV(USBS1) | _BV(UCSZ11) | _BV(UCSZ10);
+    UCSR1C = _BV(UCSZ11) | _BV(UCSZ10); /* 8 data bits, 1 stop bit, no parity */
 }
 
 static void uart_putc(uint8_t c) {
@@ -167,8 +188,8 @@ static bool tick_elapsed(void) {
  * believed was complete. That is the one failure the flag exists to prevent, arriving through the front
  * door.
  *
- * Two ticks at 20.05 ms each is about 40 ms of silence. One 133-byte frame at 38400 baud 8N2 (11 bits per
- * character) takes 133 * 11 / 38400 = 38 ms, so a sender still transmitting a frame cannot be quiet that
+ * Two ticks at 20.05 ms each is about 40 ms of silence. One 133-byte frame at 38461.5 baud 8N1 (10 bits per
+ * character) takes 133 * 10 / 38461.5 = 34.6 ms, so a sender still transmitting a frame cannot be quiet that
  * long, and a sender waiting for our NAK is quiet immediately. */
 #define PURGE_IDLE_TICKS 2u
 
@@ -245,8 +266,8 @@ static void vfd_init(void) {
 
 /*
  * Reports a key event: nothing while no key is held or the same key stays held. A new key byte is
- * read twice (the second read is the one that counts) and echoed on the UART as in the original:
- * 'o' for the arrow pair, '@' for ENTER, 'n' for anything else.
+ * read twice (the second read is the one that counts). The original also echoed 'o', '@' or 'n' on the
+ * UART for each new key; those were debug output nothing reads, and they are gone.
  */
 static poll_result_t poll_key(void) {
     static uint8_t last_key;
@@ -262,14 +283,11 @@ static poll_result_t poll_key(void) {
     key = vfd_read_keys();
     last_key = key;
     if (key == KEY_ARROWS) {
-        uart_putc('o');
         return POLL_ARROWS;
     }
     if (key == KEY_ENTER) {
-        uart_putc('@');
         return POLL_ENTER;
     }
-    uart_putc('n');
     return POLL_OTHER;
 }
 
@@ -279,7 +297,7 @@ static poll_result_t poll_key(void) {
 static void start_app(void) __attribute__((noreturn));
 
 static void start_app(void) {
-    UCSR1A = _BV(TXC1);
+    UCSR1A = _BV(TXC1) | _BV(U2X1); /* TXC1 is write-one-to-clear; U2X1 stays set so "OK" keeps its rate */
     uart_puts("OK\r\n");
     while (!(UCSR1A & _BV(TXC1))) {
     }
@@ -366,17 +384,24 @@ static xfer_status_t flash_write_page(uint32_t addr) {
 /* XMODEM-CRC receiver                                                                              */
 
 /* CRC-16/XMODEM: polynomial 0x1021, initial value 0, MSB first. */
+/* The only copy of the polynomial: the frame check and the whole-image check both run through it, so
+ * they cannot disagree about what a CRC is. */
+static uint16_t crc16_xmodem_byte(uint16_t crc, uint8_t byte) {
+    crc ^= (uint16_t)((uint16_t)byte << 8);
+    for (uint8_t bit = 0; bit < 8; bit++) {
+        if (crc & 0x8000U) {
+            crc = (uint16_t)((crc << 1) ^ 0x1021U);
+        } else {
+            crc = (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
 static uint16_t crc16_xmodem(const uint8_t *data, uint8_t len) {
     uint16_t crc = 0;
     while (len-- > 0) {
-        crc ^= (uint16_t)((uint16_t)*data++ << 8);
-        for (uint8_t bit = 0; bit < 8; bit++) {
-            if (crc & 0x8000U) {
-                crc = (uint16_t)((crc << 1) ^ 0x1021U);
-            } else {
-                crc = (uint16_t)(crc << 1);
-            }
-        }
+        crc = crc16_xmodem_byte(crc, *data++);
     }
     return crc;
 }
@@ -452,10 +477,56 @@ static int16_t wait_header(uint8_t *naks) {
     }
 }
 
+/*
+ * EOT: hold_buf is the trailer, not image data. Checks the trailer, writes the last partial page, then
+ * checks the CRC of what is really in flash. Returns XFER_OK only if the whole image is there.
+ *
+ * Without this an image cut short by a dead host or a truncated file passed every per-frame and per-page
+ * check and was started; XMODEM has no length of its own and an early EOT is legal.
+ */
+static xfer_status_t image_finish(uint16_t frames, uint32_t page_addr, uint16_t fill) {
+    /* A trailer alone is not an image. */
+    if (frames < 2) {
+        return XFER_ERR_IMAGE;
+    }
+
+    /* A held frame that is not a trailer means the host sent a bare image, or a different file. The length
+     * may not exceed what arrived (a short transfer) nor the application area. */
+    uint32_t length = (uint32_t)hold_buf[2] | ((uint32_t)hold_buf[3] << 8) | ((uint32_t)hold_buf[4] << 16) |
+                      ((uint32_t)hold_buf[5] << 24);
+    if (hold_buf[0] != TRAILER_MAGIC_0 || hold_buf[1] != TRAILER_MAGIC_1 || length == 0 ||
+        length > BOOT_START || length > (uint32_t)(frames - 1U) * FRAME_BYTES) {
+        return XFER_ERR_IMAGE;
+    }
+
+    if (fill != 0) {
+        for (uint16_t i = fill; i < PAGE_BYTES; i++) {
+            page_buf[i] = 0xFF;
+        }
+        xfer_status_t status = flash_write_page(page_addr);
+        if (status != XFER_OK) {
+            return status;
+        }
+    }
+
+    /* The CRC is read from flash, not from the receive path, so it also covers a page that was never
+     * written. Per-page read-back proves each page equals what was sent; only this proves the pages sent
+     * are the image the trailer describes. */
+    uint16_t crc = 0;
+    for (uint32_t addr = 0; addr < length; addr++) {
+        crc = crc16_xmodem_byte(crc, pgm_read_byte_far(addr));
+    }
+    if (crc != (uint16_t)(((uint16_t)hold_buf[6] << 8) | hold_buf[7])) {
+        return XFER_ERR_CRC;
+    }
+    return XFER_OK;
+}
+
 /* Receives the image whose first header byte is header. The ACK for a block follows its flash write. */
 static xfer_status_t transfer(int16_t header) {
     uint32_t page_addr = 0;
     uint16_t fill = 0;
+    uint16_t frames = 0; /* frames accepted so far, the trailer included */
     uint8_t expected = 1;
     uint8_t naks = 0;
     bool have_previous = false;
@@ -469,18 +540,13 @@ static xfer_status_t transfer(int16_t header) {
 
     for (;;) {
         if (header == EOT) {
-            if (fill != 0) {
-                for (uint16_t i = fill; i < PAGE_BYTES; i++) {
-                    page_buf[i] = 0xFF;
-                }
-                xfer_status_t status = flash_write_page(page_addr);
-                if (status != XFER_OK) {
-                    return status;
-                }
+            xfer_status_t status = image_finish(frames, page_addr, fill);
+            if (status != XFER_OK) {
+                return status; /* the flag stays set: the half-written application is never started */
             }
             uart_putc(ACK);
-            /* The image is complete and every page was read back and compared by flash_write_page(). This
-             * is the only place the flag is cleared. */
+            /* The trailer matched and the CRC of the flash contents matched it. This is the only place the
+             * flag is cleared. */
             xfer_flag_set(false);
             return XFER_OK;
         }
@@ -496,18 +562,29 @@ static xfer_status_t transfer(int16_t header) {
             uart_putc(NAK);
         } else {
             if (result == FRAME_NEW) {
-                if (page_addr == 0 && fill == 0 && !image_header_valid(page_buf)) {
+                /* The new frame sits at page_buf[fill]. Early reject on the first frame, before flash. */
+                if (frames == 0 && !image_header_valid(&page_buf[fill])) {
                     return XFER_ERR_IMAGE;
                 }
-                fill += FRAME_BYTES;
-                if (fill == PAGE_BYTES) {
-                    xfer_status_t status = flash_write_page(page_addr);
-                    if (status != XFER_OK) {
-                        return status;
-                    }
-                    page_addr += PAGE_BYTES;
-                    fill = 0;
+                /* Swap: the previously held frame lands in page_buf and becomes image data; the new frame
+                 * is held back until the next frame or EOT shows whether it is data or the trailer. */
+                for (uint8_t i = 0; i < FRAME_BYTES; i++) {
+                    uint8_t newest = page_buf[fill + i];
+                    page_buf[fill + i] = hold_buf[i];
+                    hold_buf[i] = newest;
                 }
+                if (frames != 0) {
+                    fill += FRAME_BYTES;
+                    if (fill == PAGE_BYTES) {
+                        xfer_status_t status = flash_write_page(page_addr);
+                        if (status != XFER_OK) {
+                            return status;
+                        }
+                        page_addr += PAGE_BYTES;
+                        fill = 0;
+                    }
+                }
+                frames++;
                 expected++;
                 have_previous = true;
             }

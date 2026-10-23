@@ -5,8 +5,8 @@
  *
  *   1. Run `cal_boot_defaults_init()` over an image of a real meter's EEPROM. **The result must be
  *      byte-identical.** Running our firmware on an existing meter must not change one byte of its
- *      calibration or identity data. An initialiser that rewrote the `boot_thid()` defaults would fail this
- *      test loudly -- serial, production date, cal count 5 -> 0 -- which is exactly why it is worth having.
+ *      calibration or identity data. An initialiser that rewrote `boot_thid()` defaults would fail this test loudly
+ *      -- serial, production date, cal count 5 -> 0 -- which is exactly why it is worth having.
  *   2. Run it over an erased image. The defaults must appear, and **0x0A00 must still be erased**: that
  *      word is the production-date handler's write-once guard, and stamping it would close the window for
  *      good.
@@ -370,7 +370,7 @@ static void test_negative_dcv_starts_from_the_loaded_pair(void) {
 
     check(cal_range_preview(FUNC_DCV, 0u, RATE_MEDIUM, measured, reference, true, &change) == CAL_RANGE_OK,
           "the preview accepts the point");
-    check(close_enough(change, k - 1.0f), "the previewed change is the ratio reference to measured, minus 1");
+    check(close_enough(change, k - 1.0f), "the previewed change is reference over measured, minus 1");
     check(cal_range_commit(FUNC_DCV, 0u, RATE_MEDIUM, measured, reference, true) == CAL_RANGE_OK,
           "the commit writes it");
 

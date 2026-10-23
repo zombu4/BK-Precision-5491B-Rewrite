@@ -17,9 +17,12 @@ or else wherever `avr-gcc` is on PATH. Nothing about its location is built into 
 The image step writes into build/:
 
     5491B-rewrite-full.hex   application plus this project's boot loader (at 0x1F800), merged, for ISP flashing
-    5491B-rewrite-app.hex    the application alone, for the serial boot loader
+    5491B-rewrite-app.hex    the application alone, for ISP flashing without the boot loader
+    5491B-rewrite-app-xmodem.bin
+                             the file to send to the serial boot loader with XMODEM: the application,
+                             padded to 128 bytes, plus a 128-byte trailer with its length and CRC-16
     5491B-rewrite-full.bin   the full image as raw bytes: 131072 bytes, unwritten flash is 0xFF
-    SHA256SUMS               the SHA-256 of each of the three files above, in `sha256sum` format
+    SHA256SUMS               the SHA-256 of each of the four files above, in `sha256sum` format
 
 No third-party image goes into any of them: they are made from the two ELF files this script links.
 """
@@ -181,6 +184,40 @@ def sections(elf):
     return out
 
 
+def crc16_xmodem(data):
+    """CRC-16/XMODEM (polynomial 0x1021, initial value 0, MSB first), as src/boot/boot.c computes it."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def write_xmodem_image():
+    """Write <build>/app_xmodem.bin, the file a host sends to the boot loader.
+
+    The application bytes, 0xFF-padded to a multiple of 128, followed by one 128-byte trailer block:
+    0x42 0x4B, the application length (uint32 little-endian, without padding), the CRC16 of the unpadded
+    application (big-endian, like the XMODEM frame CRC), then 0xFF. The loader refuses an image without it
+    (PROTOCOL_CHANGES G.5). app.hex and app.elf are not changed.
+    """
+    raw = BUILD / "app.bin"
+    r = run([OBJCOPY, "-O", "binary", "-R", ".eeprom", BUILD / "app.elf", raw])
+    if r.returncode != 0:
+        print("==== objcopy -O binary failed ====")
+        print((r.stderr or r.stdout).strip())
+        return 1
+    app = raw.read_bytes()
+    crc = crc16_xmodem(app)
+    padded = app + b"\xFF" * (-len(app) % 128)
+    trailer = (b"\x42\x4B" + len(app).to_bytes(4, "little") + crc.to_bytes(2, "big")).ljust(128, b"\xFF")
+    out = BUILD / "app_xmodem.bin"
+    out.write_bytes(padded + trailer)
+    print(f"app_xmodem.bin: length {len(app)} bytes, CRC16 0x{crc:04X}, file size {out.stat().st_size} bytes")
+    return 0
+
+
 def report():
     """Print the size report against the budgets. Returns True when everything is within budget."""
     rows = []
@@ -294,10 +331,12 @@ def image():
     names = {
         "full.hex": BUILD / "5491B-rewrite-full.hex",
         "app.hex": BUILD / "5491B-rewrite-app.hex",
+        "app-xmodem.bin": BUILD / "5491B-rewrite-app-xmodem.bin",
         "full.bin": BUILD / "5491B-rewrite-full.bin",
     }
     write_ihex(names["full.hex"], full)
     write_ihex(names["app.hex"], app)
+    names["app-xmodem.bin"].write_bytes((BUILD / "app_xmodem.bin").read_bytes())
     names["full.bin"].write_bytes(bytes(flat))
     sums = "".join(f"{sha256_of(p)}  {p.name}\n" for p in names.values())
     (BUILD / "SHA256SUMS").write_text(sums, newline="")
@@ -484,6 +523,8 @@ def main():
         print("build.py WITH THE REASON.")
         return 1
     print("called-by-nobody gate: clean")
+    if write_xmodem_image() != 0:
+        return 1
     rc, err = link(boot_obj, "boot",
                    extra=[f"-Wl,--section-start=.text={BOOT_START:#x}"])
     if rc != 0:

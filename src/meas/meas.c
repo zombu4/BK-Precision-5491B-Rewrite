@@ -34,7 +34,7 @@
  * declared in meas.h (frozen) and must be called from the main loop's 1 ms slot. Until it is, a converter that
  * stops answering is never detected. Check: main.c calls meas_tick_1ms() next to keys_tick_1ms().
  *
- * ---- Additions to the original's behaviour -----------------------------------------
+ * ---- Additions of 2026-10-22 ------------------------------------------------------
  * Line frequency. The converter decimation follows the LINE setting: 767 for 50 Hz, 639 for 60 Hz, so one
  * conversion lasts 20.0 ms or 16.7 ms. Every settle in this file is therefore a DURATION in milliseconds that is
  * turned into a conversion count for the line frequency in force (settle_conversions); the counts in meas.h
@@ -140,7 +140,7 @@ static const uint8_t ohm_range0_count[RATE_COUNT] = {10u, 20u, 40u};
 
 /* A pass that stalls for this long with no conversion arriving is a converter fault. It is the
  * bound the bus layer already exports. A gate that never completes is not a fault: the original reads zero
- * there, so it ends after FREQ_GATE_TIMEOUT_MS as "no signal". */
+ * there, so it ends when the counter's own deadline passes (hal/freq.c) as "no signal". */
 #define MEAS_STALL_LIMIT_MS ADC_DRDY_TIMEOUT_MS
 #define MEAS_FAULT_RETRY_MS 1000u
 
@@ -1300,12 +1300,12 @@ void meas_hold_release(void) {
 /* Called with each published reading while HOLD is armed.
  * UNVERIFIED: the value compared is `reading.primary`, what the operator sees. This
  * is a design decision; the alternative is `reading.raw`.
- * UNVERIFIED: when the first reading of a run is exactly zero the window is zero wide and the run
- * needs exact equality. A max(|first|, tiny) guard is not applied because `tiny` is not decided.
- * UNVERIFIED: the latched state keeps `reading` frozen because meas_task() stops measuring; it is
+ * UNVERIFIED (item 2): when the first reading of a run is exactly zero the window is zero wide and the run
+ * needs exact equality. The proposal's max(|first|, tiny) is not applied because `tiny` is not decided.
+ * UNVERIFIED (item 3): the latched state keeps `reading` frozen because meas_task() stops measuring; it is
  * cleared by meas_hold_release(), which the key handler and :HOLD:STATe OFF must call, and a setting change
  * un-latches it so a function or range change cannot leave the instrument frozen on the old reading.
- * UNVERIFIED: the beep is buzzer_error(), a 20 ms pulse that honours settings.beeper. */
+ * UNVERIFIED (item 4): the beep is buzzer_error(), a 20 ms pulse that honours settings.beeper. */
 static void hold_observe(float primary, bool overload) {
     const uint8_t need = (g_state.hold_count < 1u) ? 1u : g_state.hold_count;
 
@@ -1818,23 +1818,28 @@ static void step_read(void) {
     }
 }
 
-/* The counter. A gate that does not finish within FREQ_GATE_TIMEOUT_MS is "no signal", not a fault: the
- * original reads 0.0 there. The abandoned gate is stopped with freq_gate_abort(): left armed it would keep
- * Timer1 running and its capture interrupt enabled until the next freq_gate_start(). */
+/* The counter. A gate that ends without a result is "no signal", not a fault: the original reads 0.0 there.
+ * The deadline is the counter's own: gate time plus two signal periods, enforced by the Timer1
+ * overflow interrupt for the whole measurement, so this only polls. The ended gate is stopped with
+ * freq_gate_abort(): left armed it would keep its state until the next freq_gate_start(). */
 static void step_gate(void) {
     float hz = 0.0f;
     bool ok = false;
 
-    if (freq_result_ready()) {
-        if (pass.stage == ST_GATE && pass.func == FUNC_PERIOD) {
-            ok = freq_period_read(&hz, FREQ_GATE_TIMEOUT_MS);
-        } else {
-            ok = freq_read(&hz, FREQ_GATE_TIMEOUT_MS);
-        }
-    } else if (stall_ms < FREQ_GATE_TIMEOUT_MS) {
+    switch (freq_gate_poll()) {
+    case FREQ_GATE_RUNNING:
         return;
-    } else {
+    case FREQ_GATE_DONE:
+        if (pass.stage == ST_GATE && pass.func == FUNC_PERIOD) {
+            ok = freq_period_read(&hz);
+        } else {
+            ok = freq_read(&hz);
+        }
+        break;
+    case FREQ_GATE_NO_SIGNAL:
+    default:
         freq_gate_abort();
+        break;
     }
     if (!ok) {
         hz = 0.0f;

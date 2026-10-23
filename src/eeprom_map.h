@@ -254,7 +254,7 @@ typedef struct {
  * one. An erased byte must mean "safe to boot", or the first meter to see this firmware would refuse to
  * start its own application. */
 
-/* ---- Proven-unused spans (update this list when using one) ------------------------- */
+/* ---- Proven-unused spans (do not use without checking that nothing reads them) ------------------------- */
 /* 0x0AC6-0x0BFF, 0x08B0-0x09FF, 0x0E75-0x0FFF.
  * (0x0A80-0x0A81 is the boot marker; 0x0A82-0x0AC5 is the block above; 0x0E74 is EE_BOOT_XFER.) */
 

@@ -590,11 +590,12 @@ fmt_status_t fmt_parse_long(const char *s, const char **end, int32_t *out) {
 }
 
 /* The accepted grammar is exactly the original's:
- *   [space]* [sign] digit* [ '.' digit* ] [ ('e'|'E') [sign] digit* ]
+ *   [space]* [sign] digit* [ '.' digit* ] [ ('e'|'E') [sign] digit+ ]
  * with at least one mantissa digit required. A second sign, a lone '.', a lone sign, hexadecimal, "inf"
  * and "nan" are all rejected -- the original returned 0.0 for each, which its caller then reported as a
  * zero-parameter error, so a syntax error is the same refusal with the right reason. An exponent letter
- * with no digits after it still means exponent 0, which the original accepted and this port keeps. */
+ * with no digits after it ("1e", "1e+", "1e-") is a syntax error (ORIGINAL_BUGS #21); the original read it as
+ * exponent 0. */
 fmt_status_t fmt_parse_float(const char *s, const char **end, float *out) {
     const char *p = s;
     bool negative = false;
@@ -663,7 +664,6 @@ fmt_status_t fmt_parse_float(const char *s, const char **end, float *out) {
     }
 
     if (*p == 'e' || *p == 'E') {
-        const char *mark = p;
         bool exp_negative = false;
         uint8_t exp_digits = 0u;
 
@@ -680,12 +680,11 @@ fmt_status_t fmt_parse_float(const char *s, const char **end, float *out) {
             p++;
         }
         if (exp_digits == 0u) {
-            /* "1e", "1e+" and "1e-" meant exponent 0 and consumed the letter. That is kept. */
-            p = mark + 1;
-            if (*p == '-' || *p == '+') {
-                p++;
-            }
-        } else if (exp_digits >= 5u) {
+            /* ORIGINAL_BUGS #21: "1e", "1e+" and "1e-" were read as exponent 0 and consumed the letter, so a
+             * mistyped parameter was accepted as a different value. An exponent marker needs digits. */
+            return FMT_ERR_SYNTAX;
+        }
+        if (exp_digits >= 5u) {
             /* The original looped a multiply once per unit of exponent, so "1e60000" ran for a second and
              * returned nonsense. Decide it here instead. */
             if (!exp_negative) {

@@ -211,6 +211,8 @@ uint16_t cal_zero_address(func_t f, uint8_t range) {
     }
 }
 
+static cal_form_t form_of(func_t f);
+
 /* ---- Records ----------------------------------------------------------------------------------------- */
 
 bool cal_read_pair(uint16_t addr, ee_pair_t *out) {
@@ -220,10 +222,18 @@ bool cal_read_pair(uint16_t addr, ee_pair_t *out) {
     out->f0 = ee_read_f32(addr);
     out->f1 = ee_read_f32((uint16_t)(addr + 4u));
     out->sig = ee_read_u16((uint16_t)(addr + 8u));
-    /* A pair of (0, 0) WITH a valid signature is accepted and yields a zero reading. That is the original's
-     * behaviour and a dump of a calibrated meter contains two such records (the AC V 50 V slow pair and the AC A
-     * 500 mA medium pair), so refusing them here would change readings on a real instrument. */
     return out->sig == EE_SIG_VALID;
+}
+
+/* The coefficient that carries the correction is the gain: f0 in the linear DC V form (y = m * f0),
+ * f1 in every quadratic form (y = m * (f0 * m + f1)). A record whose gain is zero, or whose
+ * terms are not finite numbers, makes every reading on its range zero or NaN, so it is as unusable as a
+ * cleared signature and is refused the same way: the caller falls back to the identity of the form. A
+ * dump of a calibrated meter holds two valid-signature (0, 0) pairs; no other record in it is affected. */
+bool cal_pair_usable(func_t f, const ee_pair_t *p) {
+    const float gain = (form_of(f) == CAL_FORM_LINEAR_SIGNED) ? p->f0 : p->f1;
+
+    return isfinite(p->f0) && isfinite(p->f1) && gain != 0.0f;
 }
 
 bool cal_read_zero(uint16_t addr, ee_zero_t *out) {
@@ -351,7 +361,7 @@ static cal_pair_t load_pair(func_t f, uint8_t range, rate_t rate, cal_variant_t 
     cal_pair_t p;
     const uint16_t addr = cal_pair_address(f, range, rate, variant);
 
-    if (addr != EE_ADDR_NONE && cal_read_pair(addr, &rec)) {
+    if (addr != EE_ADDR_NONE && cal_read_pair(addr, &rec) && cal_pair_usable(f, &rec)) {
         p.f0 = rec.f0;
         p.f1 = rec.f1;
         if (valid_out != NULL) {

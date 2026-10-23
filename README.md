@@ -27,7 +27,7 @@ working, and fixes the defects found in the original firmware.
 ## Status
 
 Runs on one 5491B, the developer's unit, with that unit's original calibration data; bench checks of the
-front panel and the remote interface on it are ongoing. A simulator suite (19 tests, `sim/`, including the boot
+front panel and the remote interface on it are ongoing. A simulator suite (24 tests, `sim/`, including the boot
 loader) runs on every build. No other 5491B has been tested.
 
 ## Release files
@@ -39,7 +39,8 @@ Each release (GitHub **Releases**) is built by CI from the tagged source:
 | `5491B-rewrite-full.hex` | application + this project's boot loader, for ISP flashing (the normal way) |
 | `5491B-rewrite-full.bin` | the same image as raw bytes (131072 bytes) |
 | `5491B-rewrite-app.hex` | application only |
-| `SHA256SUMS` | hashes of the three images |
+| `5491B-rewrite-app-xmodem.bin` | the application plus a 128-byte trailer (length and CRC-16), for updating over the serial port with this project's boot loader (see below) |
+| `SHA256SUMS` | hashes of the four images |
 
 ## Flashing with an ISP programmer
 
@@ -77,6 +78,21 @@ If verification reports a mismatch, write it again; do not power the meter off w
 Do not change the fuses. Disconnect the programmer and power-cycle the meter; `*IDN?` reports `Ver2.0...`.
 
 **Back to the original firmware:** `AVRDUDE -U flash:w:backup_flash.bin:r` with your own backup.
+
+## Updating over the serial port
+
+Once this project's boot loader is in the meter (it is part of `5491B-rewrite-full.hex`), the application can be
+replaced over the remote serial port (the USB port on the unit tested) without a programmer. The download itself
+has so far been tested in the simulator only (tests T02-T07, T22-T24); on the meter, the banner and the start of
+the application have been checked. Hold both horizontal arrow keys while switching the meter on;
+the loader shows a banner and waits about 4 s for ENTER. After ENTER it sends `C` about every 1.36 s: start an
+XMODEM-CRC transfer of `5491B-rewrite-app-xmodem.bin`. The loader's serial link runs at **38461.5 baud, 8 data
+bits, no parity, 1 stop bit** (double speed, UBRR1 = 38); a host set to 38400 baud, 8N1 is within 0.16 % of it.
+
+The loader refuses an image without the trailer, reads every page back after writing it, and starts the new
+application only when the CRC of the flash contents matches the trailer. An interrupted or failed download leaves
+a flag set, and the loader refuses to start the application while it is set. See
+[docs/PROTOCOL_CHANGES.md](docs/PROTOCOL_CHANGES.md) (boot loader rows) for the byte-level details.
 
 ## Building
 

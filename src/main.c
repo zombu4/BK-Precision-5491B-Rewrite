@@ -320,11 +320,76 @@ void main_soft_reset(void) {
     }
 }
 
+/* ORIGINAL_BUGS G.1, "lock-ups and traps": an interrupt that is enabled but has no handler.
+ *
+ * avr-libc routes every vector that has no ISR() to `__bad_interrupt`, and in the release build that is
+ * literally `jmp 0` -- disassembled from a release build at 0x172E:
+ *     0000172e <__bad_interrupt>:  172e: 0c 94 00 00  jmp 0  ; 0x0 <__vectors>
+ * That is the same jump-to-zero the soft reset above exists to avoid: it re-enters the
+ * program with every peripheral still configured, the interrupt flags untouched and the stack pointer
+ * wherever the fault left it, so the restart runs on the state that produced the fault. BADISR_vect is
+ * avr-libc's documented override for all of those vectors at once (`avr/interrupt.h:245-257`, where
+ * BADISR_vect is defined as __vector_default).
+ *
+ * Routing it through the watchdog turns a spurious interrupt into a real reset through the reset vector,
+ * with every peripheral initialised from scratch. This handler is not expected to run at all; if it does,
+ * the instrument comes back in a defined state rather than a half-initialised one. */
+ISR(BADISR_vect) {
+    main_soft_reset();
+}
+
+/* ---- Stack overflow detection --------------------------------------------------------------
+ * The ATmega128 has 4096 bytes of internal SRAM, 0x0100 to 0x10FF, with the stack at the top growing down and
+ * the static data at the bottom growing up. Nothing stops the two meeting. The guard is a few bytes in
+ * `.noinit`, which the linker places directly above `.bss` and so directly below the stack's free space
+ * (`_end`): a stack that grows as far as the static data has to go through the guard first, so it is
+ * disturbed before any variable is. The loop looks at it once a pass and resets through the watchdog when
+ * it has changed, which is the safe outcome: the state that overflowed is discarded and every peripheral is
+ * initialised again. `.noinit` is not cleared by the start-up code, so the guard is written here at every
+ * start. Volatile because nothing in the program writes it again, and the compiler would otherwise fold the
+ * test away.
+ *
+ * Measured on a release build (linker map): `_end` = 0x80099D and RAMEND = 0x10FF (avr-libc, atmega128),
+ * so the stack has 0x1100 - 0x99D = 1891 bytes before it reaches the static data. The deepest path known is
+ * the formatter's big-integer digit generator, called from the display path, at about 200 bytes. */
+#define STACK_GUARD_BYTES 8u
+#define STACK_GUARD_FILL 0xA5u
+
+static volatile uint8_t stack_guard[STACK_GUARD_BYTES] __attribute__((section(".noinit")));
+
+static void stack_guard_arm(void) {
+    for (uint8_t i = 0u; i < STACK_GUARD_BYTES; i++) {
+        stack_guard[i] = STACK_GUARD_FILL;
+    }
+}
+
+static bool stack_guard_intact(void) {
+    for (uint8_t i = 0u; i < STACK_GUARD_BYTES; i++) {
+        if (stack_guard[i] != STACK_GUARD_FILL) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ---- Reset and the main loop ------------------------------------------------------------------------ */
 
 static void hardware_init(void) {
-    /* The watchdog may have brought us here. Clear the flag and disarm it before anything else, or a
-     * watchdog reset turns into a boot loop -- the reset enables it again on an AVR of this generation. */
+    /* The watchdog may have brought us here.
+     *
+     * WDRF is cleared because nothing else clears it: ATmega128A datasheet p.76, MCUCSR -- "The bit is
+     * reset by a Power-on Reset, or by writing a logic zero to the flag". Left set, it would still read as
+     * the reset source after an unrelated later reset.
+     *
+     * wdt_disable() is belt and braces, not a necessity on this part, and the reason is worth stating
+     * because the two AVR generations differ. On the ATmega88/168 family WDRF forces WDE to 1, so a
+     * watchdog reset really does come back with the watchdog armed and a boot loop follows. Not here:
+     * WDTCR's reset value is 0x00 including WDE (datasheet p.77), and with this meter's fuses -- efuse
+     * 0xFF, so WDTON and M103C both unprogrammed -- Table 15-1 on p.73 gives safety
+     * level 1 and "WDT Initial State: Disabled". So the watchdog is already off here, and the boot loader,
+     * which BOOTRST makes the first code to run after every reset, needs no watchdog handling of its own.
+     * That matters: main_soft_reset() arms a 15 ms watchdog deliberately, and if WDE survived a reset the
+     * loader could never finish its banner wait. */
     MCUCSR &= (uint8_t)~(1u << WDRF);
     wdt_disable();
 
@@ -358,6 +423,7 @@ static void hardware_init(void) {
 int main(void) {
     uint32_t last_hour_ms = 0u;
 
+    stack_guard_arm();
     hardware_init();
 
     hours_load();
@@ -377,6 +443,9 @@ int main(void) {
 
     for (;;) {
         wdt_reset();
+        if (!stack_guard_intact()) {
+            main_soft_reset();
+        }
 
         /* A calibration sweep owns the converter while it runs, so it is advanced before the measurement
          * and the measurement is skipped meanwhile. */

@@ -293,7 +293,7 @@ void scpi_parse_separator(void) {
 /* True when nothing but blanks follows the number.
  *
  * The original ignored whatever came after a number, so "12abc" was 12, "1,5" was 1 and "1 5" was 1
- * (a10 sec.4.2 item 6). ORIGINAL_BUGS #21: that silently misreads a mistyped parameter, so trailing text
+ * (ORIGINAL_BUGS #21): that silently misreads a mistyped parameter, so trailing text
  * is now a suffix error. The original had no unit-suffix table either, so nothing legitimate is lost. */
 static bool only_blanks(const char *s) {
     while (*s == ' ' || (*s >= '\t' && *s <= '\r')) {
@@ -303,7 +303,7 @@ static bool only_blanks(const char *s) {
 }
 
 /* The current number token as a float. Unparsable text is "ERROR SUFFIX" as in the original; an
- * out-of-range exponent is a data error instead of a silently wrong value; a parameter of zero is
+ * out-of-range exponent is a data error (A3) instead of a silently wrong value; a parameter of zero is
  * accepted, which the original refused. Reports and returns false. */
 bool scpi_arg_float(float *out) {
     const char *end;

@@ -117,7 +117,7 @@ _Static_assert(TEXT_CAPACITY > DATE_CHARS, "a date must fit the shared text buff
 
 /* SYS item 15, BRIGHT: the PT6311 display-control dimming field is 3 bits, codes 0 to 7, the chip's 8
  * steps of 1, 2, 4, 10, 11, 12, 13, 14 sixteenths (datasheet PT6311B V1.0, page 9, command 4; vfd.h).
- * All 8 are offered and shown as 1 to 8 (decision 2026-10-23: the top five alone changed too
+ * All 8 are offered and shown as 1 to 8 (the top five alone changed too
  * little). The level is previewed as the key is pressed and only stored on ENTER, and RESET restores the
  * brightest, so a dim choice is always undone from this same menu. */
 #define BRIGHT_MIN 0u
@@ -202,6 +202,7 @@ uint16_t main_power_on_hours(void); /* main.c: the wear-levelled hour meter */
     X(SUB_COUNT, "COUNT")                                                                                    \
     X(FUNCTION, "FUNCTION")                                                                                  \
     X(REFERENCE, "REFERENCE")                                                                                \
+    X(REF_LABEL, "REF:")                                                                                     \
     X(NEW_CODE, "NEW CODE")                                                                                  \
     X(CONFIRM, "CONFIRM")                                                                                    \
     X(LINE_60, "60 HZ")                                                                                      \
@@ -827,13 +828,21 @@ static float ui_edit_digit_down(char *text, uint8_t cursor, float value) {
     return value;
 }
 
+/* The first cell the cursor may stand on. A dB reference voltage is never negative, so its editor has
+ * no sign cell: text[0] stays '+' and the cursor starts at the first digit. HI LIMIT, LO LIMIT
+ * and PERC REF keep the sign. `state` is the editor the question is about, which is not m.state while a
+ * message is up. */
+static uint8_t first_cursor(menu_state_t state) {
+    return (state == MS_NUMERIC && m.param == NUM_DB_REF) ? 1u : 0u;
+}
+
 /* Next cursor position over the editable cells; the point is not one. */
-static uint8_t text_cursor_step(const char *text, uint8_t cursor, bool forward) {
+static uint8_t text_cursor_step(const char *text, uint8_t first, uint8_t cursor, bool forward) {
     for (uint8_t i = 0u; i < EDIT_TEXT_LEN; i++) {
         if (forward) {
-            cursor = (cursor + 1u >= EDIT_TEXT_LEN) ? 0u : (uint8_t)(cursor + 1u);
+            cursor = (cursor + 1u >= EDIT_TEXT_LEN) ? first : (uint8_t)(cursor + 1u);
         } else {
-            cursor = (cursor == 0u) ? (uint8_t)(EDIT_TEXT_LEN - 1u) : (uint8_t)(cursor - 1u);
+            cursor = (cursor <= first) ? (uint8_t)(EDIT_TEXT_LEN - 1u) : (uint8_t)(cursor - 1u);
         }
         if (text[cursor] != '.') {
             break;
@@ -1333,22 +1342,35 @@ static void render(void) {
         second = caption_P(def.caption);
         break;
     }
-    case MS_NUMERIC:
+    case MS_NUMERIC: {
+        const uint8_t first = first_cursor(MS_NUMERIC);
+        uint8_t first_char;
+
         /* The whole text, every phase. The cursor cell is blanked after layout -- substituting
          * a space for the character moved the rest of the line whenever it carried a decimal point. */
-        for (uint8_t i = 0u; i < EDIT_TEXT_LEN; i++) {
+        if (m.param == NUM_DB_REF) { /* "REF:" then the digits: no sign cell, and no cell left for a unit */
+            line_puts_P(&l, text_P(LT_REF_LABEL));
+        }
+        first_char = l.len;
+        for (uint8_t i = first; i < EDIT_TEXT_LEN; i++) {
             line_putc(&l, m.text[i]);
         }
-        blank_cell_of = m.blink_on ? NO_BLANK_CELL : m.cursor;
+        blank_cell_of = m.blink_on ? NO_BLANK_CELL : (uint8_t)(first_char + m.cursor - first);
         second = caption_P(numeric_def(m.param).caption);
         break;
+    }
     case MS_INTEGER: {
         const integer_def_t def = integer_def(m.param);
+        uint8_t first_char;
 
+        if (m.param == INT_DBM_REF) {
+            line_puts_P(&l, text_P(LT_REF_LABEL));
+        }
+        first_char = l.len;
         for (uint8_t i = 0u; i < def.digits; i++) {
             line_putc(&l, m.digits[i]);
         }
-        blank_cell_of = m.blink_on ? NO_BLANK_CELL : m.cursor;
+        blank_cell_of = m.blink_on ? NO_BLANK_CELL : (uint8_t)(first_char + m.cursor);
         if (def.suffix != '\0') {
             line_putc(&l, def.suffix);
         }
@@ -1460,7 +1482,7 @@ static void message_done(void) {
         break;
     case NEXT_RESTART:
         m.state = m.resume;
-        m.cursor = 0u;
+        m.cursor = first_cursor(m.state);
         redraw();
         break;
     case NEXT_CONFIRM: {
@@ -1574,7 +1596,7 @@ static void numeric_store(uint8_t id, float v) {
 static void start_numeric(uint8_t id) {
     m.state = MS_NUMERIC;
     m.param = id;
-    m.cursor = 0u;
+    m.cursor = first_cursor(MS_NUMERIC);
     m.value = numeric_current(id);
     eng_format(m.text, m.value);
     redraw();
@@ -1653,11 +1675,11 @@ static void numeric_key(uint8_t key) {
         redraw();
         break;
     case KEY_LEFT:
-        m.cursor = text_cursor_step(m.text, m.cursor, false);
+        m.cursor = text_cursor_step(m.text, first_cursor(MS_NUMERIC), m.cursor, false);
         redraw();
         break;
     case KEY_RIGHT:
-        m.cursor = text_cursor_step(m.text, m.cursor, true);
+        m.cursor = text_cursor_step(m.text, first_cursor(MS_NUMERIC), m.cursor, true);
         redraw();
         break;
     case KEY_ENTER:
@@ -1797,6 +1819,10 @@ static void start_shortcut(uint8_t preset_item) {
     }
     m.shortcut = true;
     m.preset_item = preset_item;
+    /* The same clear as menu_enter(): without it the measurement's minus sign and lamps stay lit behind the
+     * editor. Closing the editor, confirmed or cancelled, goes through release_display(), which redraws the
+     * measurement. */
+    display_clear_all();
 }
 
 void menu_edit_percent_ref(void) {
@@ -2788,7 +2814,7 @@ static void page_key(uint8_t key) {
 /* Level 1 (original 0xE646 with the page handlers 0x8B52, 0x8BFC, 0x8C7A): pick
  * the item. LEFT and RIGHT step through the items of every page with wrap-around. The original's TRIG
  * handler stored item 0 for both keys (0x8C4A, 0x8C60), so HOLD WIN and HOLD CNT could not be reached
- * from the panel: ORIGINAL_BUGS 33 makes that a FIX. */
+ * from the panel, which ORIGINAL_BUGS 33 fixes. */
 static void item_key(uint8_t key) {
     const page_def_t page = page_def(m.page);
     uint8_t *item = &m.item[m.page];

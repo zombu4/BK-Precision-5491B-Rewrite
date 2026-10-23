@@ -149,6 +149,18 @@ static void protected_done(void) {
  */
 static bool sweep_pending; /* a sweep this module started has not yet been terminated */
 
+/* ORIGINAL_BUGS #1 / #93: :SCAL:STD and :SCAL:TEST used to run their conversions in a loop inside the
+ * command, so the instrument was deaf for the whole measurement -- the last two blocking commands in the
+ * executor. They are now kinds on the same sweep machine the short/open sweeps use, and their reply is sent
+ * from the poll routine when the machine reaches DONE.
+ *
+ * This marker is deliberately NOT sweep_pending. A sweep's DONE branch sends the closing "!" and calls
+ * serv_note_activity(); a query's DONE branch sends a reply line and no "!". Sharing one flag would send
+ * both, which would corrupt the reply a client is parsing. */
+typedef enum { QUERY_NONE, QUERY_STD, QUERY_TEST } query_pending_t;
+
+static query_pending_t query_pending;
+
 static void report_cell(func_t f, uint8_t range, float value) {
     char text[32];
     line_t line = {.text = text, .size = sizeof text, .length = 0u};
@@ -213,6 +225,55 @@ static void sweep_service(void) {
     }
 }
 
+/* The reply for a :SCAL:STD or :SCAL:TEST that is still running. Both reply shapes are unchanged from when
+ * the command blocked: STD sends medium, fast, slow in that order (ORIGINAL_BUGS #39 -- the order is the
+ * rate index, not the order the rates were measured), TEST sends the value and a trailing colon. */
+static void query_service(void) {
+    if (query_pending == QUERY_NONE) {
+        return;
+    }
+
+    const cal_sweep_state_t state = cal_sweep_state();
+
+    if (state == CAL_SWEEP_DONE) {
+        char text[32];
+        line_t line = {.text = text, .size = sizeof text, .length = 0u};
+
+        if (query_pending == QUERY_STD) {
+            float value[RATE_COUNT];
+
+            if (cal_scal_std_result(value)) {
+                line_float(&line, value[RATE_MEDIUM], SCPI_DECIMALS_READING, false);
+                line_char(&line, ':');
+                line_float(&line, value[RATE_FAST], SCPI_DECIMALS_READING, true);
+                line_char(&line, ',');
+                line_float(&line, value[RATE_SLOW], SCPI_DECIMALS_READING, true);
+                line_send(&line);
+            } else {
+                report_cannot_execute_between_lines();
+            }
+        } else {
+            float value;
+
+            if (cal_scal_test_result(&value)) {
+                line_float(&line, value, SCPI_DECIMALS_STANDARD, false);
+                line_char(&line, ':');
+                line_send(&line);
+            } else {
+                report_cannot_execute_between_lines();
+            }
+        }
+        query_pending = QUERY_NONE;
+    } else if (state == CAL_SWEEP_FAILED) {
+        /* The guards cal.h added for the non-blocking form: a function change, a range change during STD, or
+         * a rate change during TEST ends the run. The client gets no reply line, so the reason is queued. */
+        query_pending = QUERY_NONE;
+        report_cannot_execute_between_lines();
+    } else if (state == CAL_SWEEP_IDLE) {
+        query_pending = QUERY_NONE;
+    }
+}
+
 /* The roots that would change what the converter is doing. Everything else (queries, the display, HOLD,
  * UNIT, TRIGger, FETCh, SYSTem, THID, SERVice) leaves the front end alone and is allowed during a sweep.
  * CALCulate is in the list because KMATh:STATe re-applies the active function. */
@@ -241,9 +302,10 @@ static bool root_conflicts(uint8_t root) {
  *   :OPEN[:ALL|:ONCE]   :SHORt[:ALL|:ONCE]    a bare OPEN or SHOR means ALL
  *   :STD[:DC|:AC]       a bare STD means DC
  *   :ACV:ZERO  :DCV:ZERO  :TEST  :COEF "<csv>"  :COEF?  :DATE:<date>  :SAVE
- * :CLEAR_DATA, :CLEAR_ALL, :CLEAR_INIT and :CLEAR_REL are NOT here: they stamp the cleared signature over every
- * calibration record (0x03200) and are on the transport denylist, so they fall into the unknown-keyword error
- * like any other word. Protected: COEF, COEF?, DATE, SAVE, OPEN and SHOR (serv.h). Open: STD, TEST and the two
+ * :CLEAR_DATA, :CLEAR_ALL, :CLEAR_INIT and :CLEAR_REL are NOT here and are removed on purpose, not left
+ * unfinished: they stamp the cleared signature over every calibration record (0x03200), a memory wipe that
+ * project rule 1.3 forbids outright, and they are on the transport denylist. They fall into the
+ * unknown-keyword error like any other word. Protected: COEF, COEF?, DATE, SAVE, OPEN and SHOR (serv.h). Open: STD, TEST and the two
  * zero queries.
  *
  * Differences from the original that are not new features, all because an error must not be followed by an
@@ -315,12 +377,9 @@ static void scal_sweep(bool is_short) {
  * Field 1, before the colon, is the MEDIUM reading. The vendor utility's ReadStd (@51e36c) parses
  * "<text>:<fast>,<slow>" and takes the text before the colon as medium, and the 5492B source does the same;
  * the original firmware printed one medium reading in all three fields, so it never contradicted that.
- * Decision 2026-10-22: medium, fast, slow. */
+ * The order is medium, fast, slow. */
 static void scal_std(void) {
     cal_std_kind_t kind = CAL_STD_DC;
-    float value[RATE_COUNT];
-    char text[64];
-    line_t line = {.text = text, .size = sizeof text, .length = 0u};
 
     if (scpi_next_is_colon()) {
         if (scpi_next_token() != SCPI_TOK_WORD) {
@@ -337,16 +396,12 @@ static void scal_std(void) {
         scpi_fail_bad_command();
         return;
     }
-    if (!cal_scal_std(kind, value)) {
+    if (!cal_scal_std_start(kind)) {
         scpi_fail_cannot_execute();
         return;
     }
-    line_float(&line, value[RATE_MEDIUM], SCPI_DECIMALS_READING, false);
-    line_char(&line, ':');
-    line_float(&line, value[RATE_FAST], SCPI_DECIMALS_READING, true);
-    line_char(&line, ',');
-    line_float(&line, value[RATE_SLOW], SCPI_DECIMALS_READING, true);
-    line_send(&line);
+    /* The reply is sent by query_service() when the sweep machine finishes. */
+    query_pending = QUERY_STD;
 }
 
 /* :SCAL:TEST -- the corrected reading with REL applied. The original's reply is "%e:" followed by the text of
@@ -355,20 +410,15 @@ static void scal_std(void) {
  * the omission. A trailing `?` is refused before the measurement, like `:SCAL:STD?` (PROTOCOL_CHANGES G.2
  * #43): the measurement leaves the rate and the filter state changed. */
 static void scal_test(void) {
-    float value;
-    char text[24];
-    line_t line = {.text = text, .size = sizeof text, .length = 0u};
-
     if (!require_statement_end()) {
         return;
     }
-    if (!cal_scal_test(&value)) {
+    if (!cal_scal_test_start()) {
         scpi_fail_cannot_execute();
         return;
     }
-    line_float(&line, value, SCPI_DECIMALS_STANDARD, false);
-    line_char(&line, ':');
-    line_send(&line);
+    /* The reply is sent by query_service() when the sweep machine finishes. */
+    query_pending = QUERY_TEST;
 }
 
 #define ZERO_PRINT_THRESHOLD 1.0e-7f
@@ -974,6 +1024,7 @@ static void host_link_faults(void) {
 
 void remote_init(void) {
     sweep_pending = false;
+    query_pending = QUERY_NONE;
     check_streaming = false;
     scpi_reply_init();
 }
@@ -984,6 +1035,7 @@ void remote_init(void) {
 void remote_poll(void) {
     host_link_faults();
     sweep_service();
+    query_service();
     fetch_service();
     if (check_streaming) {
         check_service();
@@ -1014,6 +1066,12 @@ void remote_go_local(void) {
         /* A client waits for the closing "!" of a sweep it started. The abort sends none, so the reason is
          * queued for :SYST:ERR? instead of leaving the client to find out by its own timeout. */
         sweep_pending = false;
+        report_cannot_execute_between_lines();
+    }
+    if (query_pending != QUERY_NONE) {
+        /* The same reasoning for a :SCAL:STD or :SCAL:TEST the LOCAL key cut short: the client is waiting
+         * for a reply line that will now never come, so the reason is queued rather than left to a timeout. */
+        query_pending = QUERY_NONE;
         report_cannot_execute_between_lines();
     }
     scpi_enter_local();

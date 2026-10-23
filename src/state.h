@@ -181,7 +181,7 @@ typedef struct {
     bool manual_trigger_req;    /* RAM 0x0F61 bit 3: a manual trigger is pending */
     bool local_lockout;         /* RAM 0x0F5F bit 3 */
     bool menu_mode;             /* RAM 0x0F61 bits 1/6/7, collapsed: a menu owns the display */
-    bool error_indicated;       /* drives the ERR lamp; set by the error queue, cleared on read */
+    bool error_indicated;       /* drives the ERR lamp; set by the error queue, cleared on read (E-5) */
     bool fetch_pending;         /* a FETC?/READ? is waiting for a completed measurement */
     bool bus_trigger_pending;   /* a *TRG / BUS trigger arrived */
 

@@ -1,7 +1,7 @@
 /*
  * sim_5491b.c - simavr test harness for the 5491B firmware.
  *
- * Runs the compiled boot loader and application on a simulated ATmega128 and executes 19 fixed tests.
+ * Runs the compiled boot loader and application on a simulated ATmega128 and executes 23 fixed tests.
  * This is host code, not firmware. Nothing here touches a serial port, avrdude or a real meter.
  *
  * Modelled peripherals (pin map from src/board.h):
@@ -16,8 +16,8 @@
  * the frequency counter inputs, ADC timing of the converter beyond /DRDY, real UART line timing beyond what
  * simavr's avr_uart.c provides (it models one byte time per received byte, avr_uart.c:avr_uart_baud_write).
  *
- * Usage: sim_5491b --app app.elf --boot boot.elf --eeprom tests/fixtures/eeprom_sanitized.bin [--only N] [--reset-pc ADDR]
- *   --only N        run test N (1..19) only
+ * Usage: sim_5491b --app app.elf --boot boot.elf --eeprom eeprom_a.bin [--only N] [--reset-pc ADDR]
+ *   --only N        run test N (1..23) only
  *   --reset-pc ADDR override the reset vector of every selected test (the tests choose 0x1F800 for boot
  *                   loader tests and 0 for application tests by themselves; this option exists to isolate
  *                   or to model the fuse setting differently)
@@ -62,7 +62,12 @@
 #define XM_ACK 0x06
 #define XM_NAK 0x15
 #define XM_CAN 0x18 /* boot.c:73-77 */
-#define XM_PAD 0x1A /* padding byte used by this sender for the unused tail of the last frame */
+#define XM_FILL 0xFFu /* pad byte of the unused tail of the last data frame (PROTOCOL_CHANGES G.5) */
+
+/* The trailer block that follows the image (boot.c:125-128): magic "BK", the application length as a
+ * little-endian uint32, the CRC16-XMODEM of the application bytes (high byte first), then 0xFF. */
+#define TRAILER_MAGIC_0 0x42u
+#define TRAILER_MAGIC_1 0x4Bu
 
 #define KEY_ARROWS 0x03u /* boot.c:64 */
 #define KEY_ENTER 0x10u  /* boot.c:65 */
@@ -112,6 +117,20 @@ typedef struct {
     uint8_t n;
     uint8_t b[VFD_FRAME_BYTES];
 } vfd_frame_t;
+
+/* Display memory of the two controllers, kept as the frames arrive (see vfd_model_frame()). */
+#define VFD_RAM_BYTES 0x24u /* vfd.c:49-50: main 0x24 bytes, second 0x21 */
+typedef struct {
+    uint8_t b[2][VFD_RAM_BYTES];
+} vfd_ram_t;
+
+/* One display-control command (0x88 to 0x8F), numbered by the frame it was in. */
+typedef struct {
+    uint64_t seq;
+    uint8_t dev;
+    uint8_t byte;
+} vfd_ctl_t;
+#define VFD_CTL_MAX (1u << 16)
 
 static struct {
     avr_t *avr;
@@ -178,6 +197,15 @@ static struct {
         vfd_frame_t *frames;
         size_t nframes;
         unsigned key_reads;
+
+        /* Not limited by the size of frames[]: the application redraws the panel after every measurement
+         * pass (main.c:555, display.c:867-881), which is tens of frames per pass, so a run of a few seconds
+         * fills frames[]. These two are kept up to date for every frame regardless. */
+        uint64_t seq; /* frames completed so far, whether or not they were stored in frames[] */
+        vfd_ram_t ram;
+        vfd_ctl_t ctl[VFD_CTL_MAX];
+        size_t nctl;
+        bool ctl_overflow;
     } vfd;
 
     ext_port_t ext_b;
@@ -477,12 +505,40 @@ static void ads_attach(void) {
 #define VFD_STB_MAIN 4u
 #define VFD_CMD_READ_KEYS 0x42u /* boot.c:61 */
 
+#define VFD_CMD_ADDRESS 0xC0u  /* vfd.c:46 */
+#define VFD_DISPLAY_BASE 0x88u /* vfd.c:43: display-control command 0b10xx1nnn, nnn = dimming code */
+
+/* Applies one completed frame to the display-memory model and the display-control log. A data write is the
+ * frame 0x40, then a frame that starts with 0xC0 | address and carries the data bytes (vfd.c:107-121), the
+ * address counting up after each byte. A display-control command is a frame of one byte. */
+static void vfd_model_frame(const vfd_frame_t *f) {
+    S.vfd.seq++;
+    if (f->n >= 2u && (f->b[0] & 0xC0u) == VFD_CMD_ADDRESS) {
+        unsigned addr = f->b[0] & 0x3Fu;
+
+        for (unsigned k = 1; k < f->n && k < VFD_FRAME_BYTES; k++, addr++) {
+            if (addr < VFD_RAM_BYTES) {
+                S.vfd.ram.b[f->dev][addr] = f->b[k];
+            }
+        }
+    } else if (f->n == 1u && (f->b[0] & 0xF8u) == VFD_DISPLAY_BASE) {
+        if (S.vfd.nctl < VFD_CTL_MAX) {
+            S.vfd.ctl[S.vfd.nctl++] = (vfd_ctl_t){.seq = S.vfd.seq, .dev = f->dev, .byte = f->b[0]};
+        } else {
+            S.vfd.ctl_overflow = true;
+        }
+    }
+}
+
 static void vfd_frame_end(void) {
     if (S.vfd.active < 0) {
         return;
     }
-    if (S.vfd.cur.n > 0 && S.vfd.nframes < VFD_FRAMES_MAX) {
-        S.vfd.frames[S.vfd.nframes++] = S.vfd.cur;
+    if (S.vfd.cur.n > 0) {
+        vfd_model_frame(&S.vfd.cur);
+        if (S.vfd.nframes < VFD_FRAMES_MAX) {
+            S.vfd.frames[S.vfd.nframes++] = S.vfd.cur;
+        }
     }
     if (S.vfd.reading_keys) {
         S.vfd.key_reads++;
@@ -1045,9 +1101,29 @@ typedef struct {
     unsigned naks;
 } xm_result_t;
 
-/* Sends len bytes of img as XMODEM-CRC frames starting at block 1, the last frame padded with XM_PAD, then
- * EOT. Waits for the answer to every frame. */
-static xm_result_t xm_send_image(const uint8_t *img, size_t len, size_t *pos, bool send_eot) {
+/* Sends one block and waits for its ACK, retransmitting after a NAK up to three times. Returns false, with
+ * r->bad_response set, when the loader answers anything else. */
+static bool xm_send_block(uint8_t blk, const uint8_t *payload, size_t *pos, xm_result_t *r) {
+    for (unsigned attempt = 0;; attempt++) {
+        xm_queue_frame(blk, payload, -1);
+        int resp = xm_response(pos, SEC(3));
+
+        if (resp == XM_ACK) {
+            r->frames_acked++;
+            return true;
+        }
+        if (resp == XM_NAK && attempt < 3) {
+            r->naks++;
+            continue;
+        }
+        r->bad_response = resp;
+        return false;
+    }
+}
+
+/* Sends len bytes of img as XMODEM-CRC data blocks starting at block 1, the last block padded with 0xFF.
+ * No trailer and no EOT. r.ok is true when every block was acknowledged. */
+static xm_result_t xm_send_data(const uint8_t *img, size_t len, size_t *pos) {
     xm_result_t r = {.ok = false, .frames_acked = 0, .bad_response = 0, .naks = 0};
     size_t frames = (len + FRAME_BYTES - 1) / FRAME_BYTES;
 
@@ -1056,37 +1132,63 @@ static xm_result_t xm_send_image(const uint8_t *img, size_t len, size_t *pos, bo
         size_t n = len - i * FRAME_BYTES;
 
         n = n > FRAME_BYTES ? FRAME_BYTES : n;
-        memset(payload, XM_PAD, sizeof payload);
+        memset(payload, XM_FILL, sizeof payload);
         memcpy(payload, img + i * FRAME_BYTES, n);
-        for (unsigned attempt = 0;; attempt++) {
-            xm_queue_frame((uint8_t)(i + 1), payload, -1);
-            int resp = xm_response(pos, SEC(3));
-
-            if (resp == XM_ACK) {
-                r.frames_acked++;
-                break;
-            }
-            if (resp == XM_NAK && attempt < 3) {
-                r.naks++;
-                continue;
-            }
-            r.bad_response = resp;
-            return r;
-        }
-    }
-    if (send_eot) {
-        uint8_t eot = XM_EOT;
-
-        host_queue(&eot, 1);
-        int resp = xm_response(pos, SEC(3));
-
-        if (resp != XM_ACK) {
-            r.bad_response = resp;
+        if (!xm_send_block((uint8_t)(i + 1), payload, pos, &r)) {
             return r;
         }
     }
     r.ok = true;
     return r;
+}
+
+/* The trailer block for an application of `length` bytes whose CRC16-XMODEM is `crc`. */
+static void xm_trailer(uint8_t t[FRAME_BYTES], uint32_t length, uint16_t crc) {
+    memset(t, 0xFF, FRAME_BYTES);
+    t[0] = TRAILER_MAGIC_0;
+    t[1] = TRAILER_MAGIC_1;
+    t[2] = (uint8_t)length;
+    t[3] = (uint8_t)(length >> 8);
+    t[4] = (uint8_t)(length >> 16);
+    t[5] = (uint8_t)(length >> 24);
+    t[6] = (uint8_t)(crc >> 8);
+    t[7] = (uint8_t)crc;
+}
+
+/* The wire image: len bytes of img as data blocks, then the trailer block carrying the given length and CRC,
+ * then EOT. A correct sender passes the true length and CRC of img[0, len); the tests of a damaged transfer
+ * pass something else. */
+static xm_result_t xm_send_stream(const uint8_t *img, size_t len, uint32_t trailer_len, uint16_t trailer_crc,
+                                  size_t *pos) {
+    xm_result_t r = xm_send_data(img, len, pos);
+
+    if (!r.ok) {
+        return r;
+    }
+    uint8_t trailer[FRAME_BYTES];
+    size_t frames = (len + FRAME_BYTES - 1) / FRAME_BYTES;
+
+    r.ok = false;
+    xm_trailer(trailer, trailer_len, trailer_crc);
+    if (!xm_send_block((uint8_t)(frames + 1), trailer, pos, &r)) {
+        return r;
+    }
+    uint8_t eot = XM_EOT;
+
+    host_queue(&eot, 1);
+    int resp = xm_response(pos, SEC(3));
+
+    if (resp != XM_ACK) {
+        r.bad_response = resp;
+        return r;
+    }
+    r.ok = true;
+    return r;
+}
+
+/* A correct transfer of img[0, len): data blocks, a trailer that tells the truth, EOT. */
+static xm_result_t xm_send_image(const uint8_t *img, size_t len, size_t *pos) {
+    return xm_send_stream(img, len, (uint32_t)len, crc16_xmodem(img, len), pos);
 }
 
 /* ------------------------------------------------------------------------------------------------ */
@@ -1260,7 +1362,7 @@ static result_t test_02(void) {
     if (t != T_PASS) {
         return t;
     }
-    xm_result_t x = xm_send_image(app_image(), len, &pos, true);
+    xm_result_t x = xm_send_image(app_image(), len, &pos);
 
     REQUIRE(x.ok, "transfer failed after %u acked frames, response %d (0x%02X)", x.frames_acked, x.bad_response,
             x.bad_response & 0xFF);
@@ -1273,10 +1375,10 @@ static result_t test_02(void) {
     size_t frame_end = (len + FRAME_BYTES - 1) / FRAME_BYTES * FRAME_BYTES;
 
     for (size_t i = len; i < padded; i++) {
-        /* The sender pads the last frame with XM_PAD; the loader pads the rest of the page (boot.c:399-401). */
-        uint8_t expect = i < frame_end ? XM_PAD : 0xFF;
-
-        REQUIRE(S.avr->flash[i] == expect, "tail byte 0x%05zX is %02X, expected %02X", i, S.avr->flash[i], expect);
+        /* The sender pads the last data frame with 0xFF and the loader pads the rest of the page with 0xFF
+         * (boot.c:503-506); the trailer frame is never written. */
+        REQUIRE(S.avr->flash[i] == 0xFFu, "tail byte 0x%05zX is %02X, expected FF%s", i, S.avr->flash[i],
+                i < frame_end ? " (sender pad)" : " (loader pad)");
     }
     REQUIRE(boot_unchanged(&diff), "boot loader area changed at 0x%05X", diff);
     REQUIRE(flash_all((uint32_t)padded, BOOT_START - padded, 0x5A, &diff),
@@ -1322,10 +1424,13 @@ static result_t test_03(void) {
         return t;
     }
     make_image(img, len);
-    xm_result_t x = xm_send_image(img, len, &pos, true);
+    xm_result_t x = xm_send_image(img, len, &pos);
 
     REQUIRE(!x.ok, "an image reaching 0x%05X was accepted", BOOT_START);
-    unsigned expect_acked = BOOT_START / FRAME_BYTES + 1; /* every frame of the allowed pages, then the first frame beyond */
+    /* The loader holds each frame back by one (boot.c:570-576), so a page is written when the frame AFTER its
+     * second frame arrives. The page at BOOT_START holds data frames BOOT_START/128+1 and +2; the frame that
+     * follows them is the trailer, which therefore triggers the refused write and is not acknowledged. */
+    unsigned expect_acked = BOOT_START / FRAME_BYTES + 2;
     REQUIRE(x.bad_response == XM_CAN, "expected CAN after %u acked frames, got response %d", expect_acked,
             x.bad_response);
     REQUIRE(x.frames_acked == expect_acked, "frames acked %u, expected %u", x.frames_acked, expect_acked);
@@ -1369,6 +1474,9 @@ static result_t test_04(void) {
     REQUIRE(resp == XM_ACK, "retransmitted block 2 answered with %d, expected ACK", resp);
     xm_queue_frame(3, app_image() + 2 * FRAME_BYTES, -1);
     REQUIRE(xm_response(&pos, SEC(3)) == XM_ACK, "block 3 was not acknowledged");
+    xm_trailer(payload, (uint32_t)len, crc16_xmodem(app_image(), len));
+    xm_queue_frame(4, payload, -1);
+    REQUIRE(xm_response(&pos, SEC(3)) == XM_ACK, "the trailer block (block 4) was not acknowledged");
     uint8_t eot = XM_EOT;
 
     host_queue(&eot, 1);
@@ -1380,7 +1488,7 @@ static result_t test_04(void) {
             "flash differs from the image at 0x%05X (flash %02X, image %02X)", diff, S.avr->flash[diff],
             app_image()[diff]);
     REQUIRE(boot_unchanged(&diff), "boot loader area changed at 0x%05X", diff);
-    info("NAK for the corrupted block, retransmission accepted, 3 frames in flash");
+    info("NAK for the corrupted block, retransmission accepted, 3 frames and a trailer sent, 3 frames in flash");
     return T_PASS;
 }
 
@@ -1398,13 +1506,14 @@ static result_t test_05(void) {
         return t;
     }
     S.app_steps = 0;
-    xm_result_t x = xm_send_image(app_image(), 4 * FRAME_BYTES, &pos, false);
+    /* Five frames: with the one-frame hold-back (boot.c:570-576) the fifth is what completes the second page. */
+    xm_result_t x = xm_send_data(app_image(), 5 * FRAME_BYTES, &pos);
 
-    REQUIRE(x.ok, "the first four frames were not acknowledged (response %d)", x.bad_response);
+    REQUIRE(x.ok, "the first five frames were not acknowledged (response %d)", x.bad_response);
     partial[0] = XM_SOH;
-    partial[1] = 5;
-    partial[2] = (uint8_t)~5;
-    memcpy(partial + 3, app_image() + 4 * FRAME_BYTES, 50);
+    partial[1] = 6;
+    partial[2] = (uint8_t)~6;
+    memcpy(partial + 3, app_image() + 5 * FRAME_BYTES, 50);
     host_queue(partial, sizeof partial);
     run_status_t r = run_until(pred_queue_empty, NULL, SEC(2));
 
@@ -1515,7 +1624,7 @@ static result_t test_07(void) {
     if (t != T_PASS) {
         return t;
     }
-    xm_result_t x = xm_send_image(app_image(), len, &pos, true);
+    xm_result_t x = xm_send_image(app_image(), len, &pos);
 
     REQUIRE(x.ok, "transfer failed after %u acked frames, response %d", x.frames_acked, x.bad_response);
     run_status_t r = wait_rx_str("OK\r\n", pos, SEC(2), &pos);
@@ -1544,19 +1653,11 @@ static const char *ee_region(unsigned off) {
     return "not a documented runtime-written location";
 }
 
-static unsigned ee_report_diff(const uint8_t *before, const uint8_t *after) {
-    unsigned n = 0;
-
-    for (unsigned i = 0; i < EEPROM_BYTES; i++) {
-        if (before[i] != after[i]) {
-            if (n < 32) {
-                info("EEPROM 0x%04X: %02X -> %02X  %s", i, before[i], after[i], ee_region(i));
-            }
-            n++;
-        }
-    }
-    return n;
-}
+/* ee_report_diff() lived here and was called by nobody: the one test that compares a whole EEPROM image,
+ * T08, has its own loop with its own pass/fail rule. It is deleted rather than kept "in case", which is the
+ * same rule the firmware's called-by-nobody gate applies to src/ -- six functions in this port compiled,
+ * linked and were called by nobody. ee_region() survives
+ * because T08's loop now uses it to name the region a stray write landed in. */
 
 /* The bytes this firmware is allowed to change on a normal boot, and nothing else.
  *
@@ -1613,7 +1714,11 @@ static result_t test_08(void) {
         diffs++;
         if (a < EE_PWRUP_COUNT_ADDR || a >= EE_PWRUP_COUNT_ADDR + EE_PWRUP_COUNT_LEN) {
             outside++;
-            info("EEPROM 0x%04X: %02X -> %02X  OUTSIDE the power-up counter", a, S.ee_initial[a], after[a]);
+            /* ee_region() names what the address belongs to, with its eeprom_map.h line. A bare address
+             * in a failure message sends the reader to the map by hand; this says "EE_SERV_FAILS" and
+             * where that is written down. */
+            info("EEPROM 0x%04X: %02X -> %02X  OUTSIDE the power-up counter -- %s", a, S.ee_initial[a],
+                 after[a], ee_region(a));
         }
     }
     REQUIRE(outside == 0, "%u byte(s) changed outside EE_PWRUP_COUNT (listed above)", outside);
@@ -1824,12 +1929,30 @@ static const char *watchdog_control(void) {
         snprintf(buf, sizeof buf, "*RST was not delivered (%s)", run_text(r));
         return buf;
     }
-    r = run_until(pred_resets, &one, SEC(2));
+    /* The budget is 4 s, not 2, and the reason is a simavr modelling limit rather than slack.
+     *
+     * `main_soft_reset()` arms a 15 ms watchdog, but simavr does not act on the new prescaler. In
+     * `avr_watchdog_write` (simavr/sim/avr_watchdog.c:108-118) `old_wdp` is read AFTER
+     * `avr_core_watch_write` has already stored the new value, so `wdp_changed` compares the new prescaler
+     * with itself and is always false; with the watchdog already enabled `enable_changed` is false too, and
+     * `avr_watchdog_set_cycle_count_and_timer` returns at its guard (:76-79) without registering a cycle
+     * timer. So the 15 ms arm has no effect here and what actually expires is the timer the last WDR
+     * registered, at the main loop's WDTO_2S period: 2048 << 7 = 262144 counts, times 12 MHz / 128 kHz,
+     * is 24,576,000 cycles = 2.048 s. A 2 s budget cannot see it.
+     *
+     * This is the simulator, not the firmware: on the part a WDTCR write takes effect immediately
+     * (ATmega128A datasheet p.77). The control asks only "does *RST reset the instrument", and 4 s answers
+     * that without asserting a precision simavr does not have. It still fails if no reset comes at all.
+     *
+     * It passed at 2 s until 2026-10-23 because the reply used to be paced at 1 ms per character, so the
+     * firmware reached the spin well after its last WDR and the remainder of the 2.048 s fitted inside the
+     * budget. Removing that pause (ORIGINAL_BUGS #8) left the full period to run. */
+    r = run_until(pred_resets, &one, SEC(4));
 
     if (r != RUN_OK) {
         static char buf[160];
 
-        snprintf(buf, sizeof buf, "no reset within 2 s of *RST (%s, WDTCR 0x%02X)", run_text(r),
+        snprintf(buf, sizeof buf, "no reset within 4 s of *RST (%s, WDTCR 0x%02X)", run_text(r),
                  S.avr->data[ADDR_WDTCR]);
         return buf;
     }
@@ -2708,12 +2831,586 @@ static result_t test_19(void) {
 }
 
 /* ------------------------------------------------------------------------------------------------ */
+/* Panel tests: what the display controllers were told                                              */
+
+#define VFD_MAIN 0u
+#define VFD_SECOND 1u
+#define VFD_FLAG_ADDR 0x1Bu    /* vfd.h:16 */
+#define VFD_FLAG_MINUS 0x20u   /* vfd.h:17 */
+#define VFD_TEXT_CELLS 9u      /* vfd.h:14 */
+#define VFD_LAMP_CELLS 10u     /* annun_table (tables.c:158-163): the lamp bytes are 0x02, 0x05 ... 0x1D, the third byte of cells 0-9 */
+#define VFD_DIM_CODES 8u
+
+#define EE_SET_BRIGHT 0x0A84u    /* src/eeprom_map.h:201 */
+#define EE_BOOT_XFER 0x0E74u     /* src/eeprom_map.h:253 */
+#define EE_BOOT_XFER_ACTIVE 0x5Au /* src/eeprom_map.h:254 */
+
+#define MENU_MESSAGE_MS 1000u /* menu.c:78: the SAVED message */
+#define BRIGHT_ITEM_INDEX 14u /* position of BRIGHT in sys_items[], menu.c:374-393 */
+
+/* Glyphs, from src/tables.c:19-26: a cell is the high byte at address 3n and the low byte at 3n+1. */
+static const uint16_t GLYPH_DIGIT[10] = {0x2362, 0x0808, 0x8361, 0x0343, 0xA203, 0xA143, 0xA163, 0x0508, 0xA363, 0xA343};
+static const uint16_t GLYPH_BRIGHT[6] = {0x0B4B /* B */, 0xA325 /* R */, 0x0948 /* I */,
+                                         0x2163 /* G */, 0xA223 /* H */, 0x0908 /* T */};
+
+static void vfd_snapshot(vfd_ram_t *ram) { *ram = S.vfd.ram; }
+
+static uint16_t ram_glyph(const vfd_ram_t *ram, unsigned dev, unsigned cell) {
+    return (uint16_t)(((unsigned)ram->b[dev][3u * cell] << 8) | ram->b[dev][3u * cell + 1u]);
+}
+
+/* Cells first .. first+count-1 of a controller whose glyph is not blank. */
+static unsigned ram_cells_lit(const vfd_ram_t *ram, unsigned dev, unsigned first, unsigned count) {
+    unsigned n = 0;
+
+    for (unsigned c = first; c < first + count; c++) {
+        n += ram_glyph(ram, dev, c) != 0u;
+    }
+    return n;
+}
+
+/* Lamp bytes that are not zero, on both controllers. */
+static unsigned ram_lamps_lit(const vfd_ram_t *ram) {
+    unsigned n = 0;
+
+    for (unsigned dev = 0; dev < 2u; dev++) {
+        for (unsigned c = 0; c < VFD_LAMP_CELLS; c++) {
+            n += ram->b[dev][3u * c + 2u] != 0u;
+        }
+    }
+    return n;
+}
+
+/* True when the first n cells of the text line hold exactly want[] and the rest of the nine are blank. */
+static bool ram_line_is(const vfd_ram_t *ram, unsigned dev, const uint16_t *want, unsigned n) {
+    for (unsigned c = 0; c < VFD_TEXT_CELLS; c++) {
+        if (ram_glyph(ram, dev, c) != (c < n ? want[c] : 0u)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *ram_line_text(const vfd_ram_t *ram, unsigned dev) {
+    static char buf[4][VFD_TEXT_CELLS * 5u + 1u];
+    static unsigned next;
+    char *out = buf[next++ % 4u];
+
+    out[0] = '\0';
+    for (unsigned c = 0; c < VFD_TEXT_CELLS; c++) {
+        snprintf(out + strlen(out), sizeof buf[0] - strlen(out), "%s%04X", c ? " " : "", ram_glyph(ram, dev, c));
+    }
+    return out;
+}
+
+/* The last display-control byte (0x88 to 0x8F) sent to controller dev by the frames after number `mark`
+ * (S.vfd.seq at the time), or -1 when there was none. */
+static int last_display_on(uint64_t mark, unsigned dev) {
+    int last = -1;
+
+    for (size_t i = 0; i < S.vfd.nctl; i++) {
+        if (S.vfd.ctl[i].seq > mark && S.vfd.ctl[i].dev == dev) {
+            last = S.vfd.ctl[i].byte;
+        }
+    }
+    return last;
+}
+
+static run_status_t key_tap_group(unsigned group, uint8_t scan_bit) {
+    S.keys[group] = scan_bit;
+    run_status_t r = run_for(MS(KEY_HOLD_MS));
+
+    S.keys[group] = 0;
+    return r == RUN_OK ? run_for(MS(KEY_GAP_MS)) : r;
+}
+
+#define TAP(group, bit)                                                                                  \
+    do {                                                                                                 \
+        if (key_tap_group((group), (bit)) != RUN_OK) {                                                   \
+            FAILF("%s", stopped_text());                                                                 \
+        }                                                                                                \
+    } while (0)
+
+/* The application is running its measurement loop and has settled. */
+static result_t measuring_start(void) {
+    unsigned want = 5;
+    run_status_t r = run_until(pred_rdata, &want, SEC(30));
+
+    REQUIRE(r == RUN_OK, "the measurement loop never started: %s", run_text(r));
+    r = run_for(SEC(2));
+    REQUIRE(r == RUN_OK, "%s", stopped_text());
+    return T_PASS;
+}
+
+/* The digit shown by the open BRIGHT choice editor: 1 to 8, or 0 when the main line is anything but exactly
+ * one such digit in cell 0 with the other eight cells blank. The value blinks, visible for 310 ms of every
+ * 600 (menu.c:75-76), so a blank line is looked at again 300 ms later, which falls in a visible phase
+ * wherever the first look fell. */
+static unsigned bright_digit(vfd_ram_t *ram) {
+    vfd_snapshot(ram);
+    if (ram_cells_lit(ram, VFD_MAIN, 0, VFD_TEXT_CELLS) == 0u) {
+        if (run_for(MS(300)) != RUN_OK) {
+            return 0;
+        }
+        vfd_snapshot(ram);
+    }
+    for (unsigned d = 1; d <= VFD_DIM_CODES; d++) {
+        if (ram_glyph(ram, VFD_MAIN, 0) == GLYPH_DIGIT[d]) {
+            return ram_cells_lit(ram, VFD_MAIN, 1, VFD_TEXT_CELLS - 1u) == 0u ? d : 0u;
+        }
+    }
+    return 0;
+}
+
+/* 20. BRIGHT offers the chip's eight dimming codes, shown as 1 to 8, drives the matching display-control byte
+ * to both controllers, and keeps the choice across a reset. */
+static result_t test_20(void) {
+    static const uint8_t to_sys_items[] = {ZK_SHIFT, ZK_MENU, ZK_NEXT, ZK_NEXT, ZK_DOWN};
+    vfd_ram_t ram;
+
+    app_open();
+    result_t t = measuring_start();
+
+    if (t != T_PASS) {
+        return t;
+    }
+    uint8_t *ee = eeprom_array();
+
+    REQUIRE(ee != NULL, "the simulated EEPROM array could not be found");
+    /* An unset or out-of-range byte means the brightest level (menu.c:912-917, vfd.h:52). */
+    const unsigned initial = ee[EE_SET_BRIGHT] > VFD_DIM_CODES - 1u ? VFD_DIM_CODES - 1u : ee[EE_SET_BRIGHT];
+    const char *err = key_taps(to_sys_items, sizeof to_sys_items);
+
+    REQUIRE(err == NULL, "%s", err);
+    for (unsigned i = 0; i < BRIGHT_ITEM_INDEX; i++) {
+        TAP(0, ZK_NEXT);
+    }
+    vfd_snapshot(&ram);
+    REQUIRE(ram_line_is(&ram, VFD_MAIN, GLYPH_BRIGHT, 6), "SYS item %u does not read BRIGHT, the main line is: %s",
+            BRIGHT_ITEM_INDEX, ram_line_text(&ram, VFD_MAIN));
+    TAP(0, ZK_DOWN);
+    unsigned digit = bright_digit(&ram);
+
+    REQUIRE(digit == initial + 1u, "the editor opened showing %u (main line %s), expected %u for stored code %u", digit,
+            ram_line_text(&ram, VFD_MAIN), initial + 1u, initial);
+    REQUIRE(ram_line_is(&ram, VFD_SECOND, GLYPH_BRIGHT, 6), "the second line does not name BRIGHT: %s",
+            ram_line_text(&ram, VFD_SECOND));
+
+    /* 1. Eight steps. Eight presses of NEXT must visit eight different digits, each one a single character
+     * from 1 to 8 (a fraction such as 10/16 occupies more cells and reads as 0), step by one, and wrap from 8
+     * to 1. Five choices would repeat after five presses, sixteen would reach a two-character value. */
+    unsigned seen[VFD_DIM_CODES + 1u] = {0};
+    bool wrapped = false;
+    unsigned prev = digit;
+
+    seen[prev]++;
+    for (unsigned press = 1; press <= VFD_DIM_CODES; press++) {
+        TAP(0, ZK_NEXT);
+        digit = bright_digit(&ram);
+        REQUIRE(digit != 0u, "after %u presses the line is not a single digit 1-8: %s", press,
+                ram_line_text(&ram, VFD_MAIN));
+        REQUIRE(digit == (prev == VFD_DIM_CODES ? 1u : prev + 1u), "press %u went from %u to %u", press, prev, digit);
+        wrapped |= prev == VFD_DIM_CODES;
+        seen[digit]++;
+        prev = digit;
+    }
+    unsigned distinct = 0;
+
+    for (unsigned d = 1; d <= VFD_DIM_CODES; d++) {
+        distinct += seen[d] != 0u;
+    }
+    REQUIRE(distinct == VFD_DIM_CODES, "%u distinct choices seen in a full turn, expected %u", distinct, VFD_DIM_CODES);
+    REQUIRE(wrapped, "stepping past 8 never wrapped to 1");
+    REQUIRE(digit == initial + 1u, "after eight presses the line shows %u, expected the starting %u", digit,
+            initial + 1u);
+    TAP(0, ZK_PREV);
+    digit = bright_digit(&ram);
+    REQUIRE(digit == (initial == 0u ? VFD_DIM_CODES : initial), "PREV from %u gave %u", initial + 1u, digit);
+    TAP(0, ZK_NEXT);
+
+    /* 2. A choice that is only previewed is dimmed on the wire at once and undone when the editor is left with
+     * UP (menu.c:1975-1979, 1988-1994). */
+    for (unsigned i = 0; i < 3u; i++) {
+        TAP(0, ZK_NEXT);
+    }
+    const unsigned previewed = (initial + 3u) % VFD_DIM_CODES;
+
+    for (unsigned dev = 0; dev < 2u; dev++) {
+        REQUIRE(last_display_on(0, dev) == (int)(VFD_DISPLAY_BASE + previewed),
+                "controller %u: the previewed choice %u did not reach the wire (last display-control byte 0x%02X)", dev,
+                previewed + 1u, (unsigned)last_display_on(0, dev));
+    }
+    uint64_t mark = S.vfd.seq;
+
+    TAP(0, ZK_UP);
+    REQUIRE(run_for(MS(100)) == RUN_OK, "%s", stopped_text());
+    for (unsigned dev = 0; dev < 2u; dev++) {
+        REQUIRE(last_display_on(mark, dev) == (int)(VFD_DISPLAY_BASE + initial),
+                "controller %u: leaving without ENTER left the dimming at 0x%02X, expected the stored 0x%02X", dev,
+                (unsigned)last_display_on(mark, dev), VFD_DISPLAY_BASE + initial);
+    }
+
+    /* 3. Every choice, entered. The last one is neither the factory default (code 7) nor the stored value the
+     * session started with, so the reset below can tell a kept choice from an untouched one. */
+    const unsigned last = initial == 2u ? 3u : 2u;
+    unsigned order[VFD_DIM_CODES];
+    unsigned n = 0;
+
+    for (unsigned k = 0; k < VFD_DIM_CODES; k++) {
+        if (k != last) {
+            order[n++] = k;
+        }
+    }
+    order[n++] = last;
+    unsigned stored = initial;
+
+    for (unsigned i = 0; i < VFD_DIM_CODES; i++) {
+        const unsigned k = order[i];
+        const unsigned steps = (k + VFD_DIM_CODES - stored) % VFD_DIM_CODES;
+        const uint8_t want = (uint8_t)(VFD_DISPLAY_BASE + k);
+
+        TAP(0, ZK_DOWN);
+        digit = bright_digit(&ram);
+        REQUIRE(digit == stored + 1u, "choice %u: the editor opened showing %u, expected the stored %u (%s)", k + 1u, digit,
+                stored + 1u, ram_line_text(&ram, VFD_MAIN));
+        for (unsigned s = 0; s < steps; s++) {
+            TAP(0, ZK_NEXT);
+        }
+        digit = bright_digit(&ram);
+        REQUIRE(digit == k + 1u, "choice %u: the line shows %u (%s)", k + 1u, digit, ram_line_text(&ram, VFD_MAIN));
+        mark = S.vfd.seq;
+        TAP(0, ZK_ENTER);
+        REQUIRE(run_for(MS(MENU_MESSAGE_MS + 300u)) == RUN_OK, "%s", stopped_text());
+        REQUIRE(!S.vfd.ctl_overflow, "the display-control log is full");
+        for (unsigned dev = 0; dev < 2u; dev++) {
+            unsigned sent = 0;
+
+            for (size_t e = 0; e < S.vfd.nctl; e++) {
+                if (S.vfd.ctl[e].seq > mark && S.vfd.ctl[e].dev == dev) {
+                    REQUIRE(S.vfd.ctl[e].byte == want,
+                            "choice %u, controller %u: display-control byte 0x%02X after ENTER, expected 0x%02X", k + 1u,
+                            dev, S.vfd.ctl[e].byte, want);
+                    sent++;
+                }
+            }
+            REQUIRE(sent > 0u, "choice %u: ENTER sent no display-control byte to controller %u (expected 0x%02X)", k + 1u,
+                    dev, want);
+        }
+        REQUIRE(ee[EE_SET_BRIGHT] == k, "choice %u: EEPROM 0x%04X holds 0x%02X, expected 0x%02X", k + 1u, EE_SET_BRIGHT,
+                ee[EE_SET_BRIGHT], k);
+        stored = k;
+    }
+
+    /* 4. The stored choice survives a reset: the firmware sends it again at start-up and keeps sending it. */
+    REQUIRE(stored == last && stored != VFD_DIM_CODES - 1u && stored != initial, "internal: the last choice is not distinctive");
+    mark = S.vfd.seq;
+    uint64_t cycles_before_reset = S.avr->cycle;
+
+    avr_reset(S.avr);
+    S.base_cycles += cycles_before_reset;
+    on_avr_reset();
+    S.keys[0] = 0;
+    REQUIRE(run_for(SEC(8)) == RUN_OK, "%s", stopped_text());
+    REQUIRE(!S.vfd.ctl_overflow, "the display-control log is full");
+    ee = eeprom_array();
+    REQUIRE(ee != NULL && ee[EE_SET_BRIGHT] == stored, "after the reset EEPROM 0x%04X holds 0x%02X, expected 0x%02X",
+            EE_SET_BRIGHT, ee == NULL ? 0u : ee[EE_SET_BRIGHT], stored);
+    const uint8_t want = (uint8_t)(VFD_DISPLAY_BASE + stored);
+
+    for (unsigned dev = 0; dev < 2u; dev++) {
+        bool found = false;
+        unsigned after = 0;
+
+        for (size_t e = 0; e < S.vfd.nctl; e++) {
+            if (S.vfd.ctl[e].seq <= mark || S.vfd.ctl[e].dev != dev) {
+                continue;
+            }
+            if (found) {
+                REQUIRE(S.vfd.ctl[e].byte == want,
+                        "controller %u: display-control 0x%02X after restart, the stored choice is 0x%02X", dev,
+                        S.vfd.ctl[e].byte, want);
+                after++;
+            } else if (S.vfd.ctl[e].byte == want) {
+                found = true;
+            }
+        }
+        REQUIRE(found, "controller %u: the firmware never sent the stored dimming code 0x%02X after the reset", dev, want);
+        REQUIRE(after > 0u, "controller %u: the stored dimming code was sent once and never again, so nothing shows it holds",
+                dev);
+    }
+    info("8 choices shown 1-8, ENTER sent 0x88-0x8F to both controllers, choice %u (0x%02X) kept after a reset", stored + 1u,
+         want);
+    return T_PASS;
+}
+
+/* The shortcut keys of the three reference editors, all in scan byte 1 (keys.c:44): REL bit 1, DIODE bit 3,
+ * ACDC bit 4, pressed after SHIFT (keys.c:494-533). */
+typedef struct {
+    const char *name;
+    uint8_t scan_bit;
+} shortcut_t;
+
+static const shortcut_t SHORTCUTS[3] = {
+    {"dB REF, SHIFT+ACDC", 0x10u},
+    {"dBm REF, SHIFT+DIODE", 0x08u},
+    {"PERC REF, SHIFT+REL", 0x02u},
+};
+
+/* The converter code that reads -0.05 V on DC V range 4 (scale 0.25, tables.c:187; 2.86e-7 V per count,
+ * ZS_VOLTS_PER_COUNT). It stays negative under every mode the three shortcuts turn on: 20 log10(0.05) = -26 dB,
+ * 10 log10(0.05^2 / 75 / 0.001) = -14.8 dBm (meas.c:1172-1196) and 100 (-0.05 - 1) / 1 = -105 % (meas.c:1227-1236,
+ * reference 1.0, main.c:220-222). */
+#define NEGATIVE_INPUT_CODE (-700000)
+#define SHORTCUT_SETTLE SEC(4)
+
+static result_t shortcut_case(const shortcut_t *sc, bool confirm) {
+    vfd_ram_t before;
+    vfd_ram_t open;
+    vfd_ram_t after;
+
+    app_open();
+    result_t t = measuring_start();
+
+    if (t != T_PASS) {
+        return t;
+    }
+    /* Manual ranging at the lowest DC V range, as zs_run() does (keys.c:330-346), then a negative input. */
+    S.ads.code = 0;
+    for (unsigned i = 0; i < 6u; i++) {
+        TAP(0, ZK_DOWN);
+    }
+    S.ads.code = NEGATIVE_INPUT_CODE;
+    REQUIRE(run_for(SHORTCUT_SETTLE) == RUN_OK, "%s", stopped_text());
+
+    /* The reading is negative and drawn: without this a clear flag proves nothing. */
+    vfd_snapshot(&before);
+    REQUIRE((before.b[VFD_MAIN][VFD_FLAG_ADDR] & VFD_FLAG_MINUS) != 0u,
+            "%s: the minus flag is not set on a negative reading (flag byte 0x%02X), the test cannot observe it clearing",
+            sc->name, before.b[VFD_MAIN][VFD_FLAG_ADDR]);
+    REQUIRE(ram_cells_lit(&before, VFD_MAIN, 0, 6) >= 3u, "%s: no reading is drawn before the editor opens (%s)", sc->name,
+            ram_line_text(&before, VFD_MAIN));
+    REQUIRE(ram_lamps_lit(&before) > 0u, "%s: no measurement lamp is lit before the editor opens", sc->name);
+
+    TAP(0, ZK_SHIFT);
+    TAP(1, sc->scan_bit);
+    REQUIRE(run_for(MS(300)) == RUN_OK, "%s", stopped_text());
+    vfd_snapshot(&open);
+    REQUIRE(ram_cells_lit(&open, VFD_SECOND, 0, VFD_TEXT_CELLS) > 0u,
+            "%s: the editor did not open (no caption on the second line, main line %s)", sc->name,
+            ram_line_text(&open, VFD_MAIN));
+    REQUIRE(memcmp(open.b[VFD_MAIN], before.b[VFD_MAIN], VFD_FLAG_ADDR) != 0, "%s: the main line is unchanged by the editor",
+            sc->name);
+    REQUIRE((open.b[VFD_MAIN][VFD_FLAG_ADDR] & VFD_FLAG_MINUS) == 0u,
+            "%s: the minus flag is still set while the editor is open (flag byte 0x%02X)", sc->name,
+            open.b[VFD_MAIN][VFD_FLAG_ADDR]);
+    REQUIRE(ram_lamps_lit(&open) == 0u, "%s: %u measurement lamp byte(s) are lit while the editor is open", sc->name,
+            ram_lamps_lit(&open));
+
+    if (confirm) {
+        TAP(0, ZK_ENTER);
+        REQUIRE(run_for(MS(MENU_MESSAGE_MS)) == RUN_OK, "%s", stopped_text());
+    } else {
+        TAP(0, ZK_MENU);
+    }
+    REQUIRE(run_for(SHORTCUT_SETTLE) == RUN_OK, "%s", stopped_text());
+    vfd_snapshot(&after);
+    REQUIRE(memcmp(after.b[VFD_MAIN], open.b[VFD_MAIN], VFD_RAM_BYTES) != 0,
+            "%s, %s: the panel still shows the editor (main line %s)", sc->name, confirm ? "confirmed" : "cancelled",
+            ram_line_text(&after, VFD_MAIN));
+    REQUIRE((after.b[VFD_MAIN][VFD_FLAG_ADDR] & VFD_FLAG_MINUS) != 0u,
+            "%s, %s: the minus flag did not come back (flag byte 0x%02X)", sc->name, confirm ? "confirmed" : "cancelled",
+            after.b[VFD_MAIN][VFD_FLAG_ADDR]);
+    REQUIRE(ram_cells_lit(&after, VFD_MAIN, 0, 6) >= 3u && ram_cells_lit(&after, VFD_MAIN, 6, 3) > 0u,
+            "%s, %s: the reading is not drawn again (%s)", sc->name, confirm ? "confirmed" : "cancelled",
+            ram_line_text(&after, VFD_MAIN));
+    REQUIRE(ram_lamps_lit(&after) > 0u, "%s, %s: no measurement lamp came back", sc->name, confirm ? "confirmed" : "cancelled");
+    if (!confirm) {
+        REQUIRE(memcmp(&after, &before, sizeof after) == 0,
+                "%s, cancelled: the panel is not what it was before the editor (main %s, was %s)", sc->name,
+                ram_line_text(&after, VFD_MAIN), ram_line_text(&before, VFD_MAIN));
+    }
+    return T_PASS;
+}
+
+/* 21. The reference editors opened from the SHIFT layer clear the measurement's minus sign and lamps while they
+ * are open, and both ways out redraw the measurement, the minus sign included. */
+static result_t test_21(void) {
+    for (unsigned i = 0; i < 3u; i++) {
+        for (unsigned confirm = 0; confirm < 2u; confirm++) {
+            result_t t = shortcut_case(&SHORTCUTS[i], confirm != 0u);
+
+            if (t != T_PASS) {
+                return t;
+            }
+            info("%s: editor clears minus flag and lamps, %s redraws the reading with the minus flag", SHORTCUTS[i].name,
+                 confirm ? "ENTER" : "MENU");
+        }
+    }
+    return T_PASS;
+}
+
+/* What a refused transfer must leave behind. x is the sender's result, pos the receive index. statuses lists
+ * the FAIL letters that count as the right refusal. The incomplete flag stays set, the application region is
+ * never executed, the loader keeps asking for a download, and after a reset with no key held the application
+ * is still not started. */
+static result_t refused_transfer(const xm_result_t *x, size_t pos, const char *statuses) {
+    uint32_t diff;
+
+    REQUIRE(!x->ok, "the loader accepted a damaged transfer");
+    REQUIRE(x->bad_response == XM_CAN, "the loader answered %d (0x%02X), expected CAN", x->bad_response,
+            x->bad_response & 0xFF);
+    run_status_t r = wait_rx_str("FAIL ", pos, SEC(3), &pos);
+
+    REQUIRE(r == RUN_OK, "no \"FAIL\" line after the damaged transfer: %s", run_text(r));
+    int status = wait_rx_byte(pos, SEC(1));
+
+    REQUIRE(status > 0 && strchr(statuses, status) != NULL, "FAIL status %d is not one of \"%s\"", status, statuses);
+    pos++;
+    const uint8_t *ee = eeprom_array();
+
+    REQUIRE(ee != NULL, "the simulated EEPROM array could not be found");
+    REQUIRE(ee[EE_BOOT_XFER] == EE_BOOT_XFER_ACTIVE, "the incomplete flag 0x%04X was cleared (0x%02X) by a refused transfer",
+            EE_BOOT_XFER, ee[EE_BOOT_XFER]);
+    REQUIRE(memmem(S.rx_buf, S.rx_len, "OK\r\n", 4) == NULL, "the loader reported success");
+    r = wait_rx_str("C", pos, SEC(3), &pos);
+    REQUIRE(r == RUN_OK, "the loader did not resume requesting a download: %s", run_text(r));
+    REQUIRE(S.app_steps == 0, "the application region was executed (%" PRIu64 " steps)", S.app_steps);
+    REQUIRE(boot_unchanged(&diff), "boot loader area changed at 0x%05X", diff);
+
+    uint64_t cycles_before_reset = S.avr->cycle;
+
+    avr_reset(S.avr);
+    S.base_cycles += cycles_before_reset;
+    on_avr_reset();
+    S.keys[0] = 0;
+    S.app_steps = 0;
+    r = run_for(SEC(10)); /* past ENTER_WAIT_TICKS, about 4.0 s */
+    REQUIRE(r == RUN_OK, "%s", stopped_text());
+    REQUIRE(S.app_steps == 0, "the loader started the refused image after a power cycle (%" PRIu64 " steps)", S.app_steps);
+    return T_PASS;
+}
+
+/* 22. A transfer that ends cleanly but short is refused: the trailer claims more application bytes than were
+ * sent. XMODEM carries no length, so before the trailer this was accepted and started (PROTOCOL_CHANGES G.5). */
+static result_t test_22(void) {
+    size_t pos;
+    const size_t sent = 8 * FRAME_BYTES;
+
+    REQUIRE(g_app_len > sent, "internal: the application image (%u bytes) is not longer than the truncated transfer", g_app_len);
+    boot_open(false, KEY_ARROWS);
+    boot_snapshot();
+    const uint8_t *ee = eeprom_array();
+
+    REQUIRE(ee != NULL && ee[EE_BOOT_XFER] != EE_BOOT_XFER_ACTIVE, "internal: the incomplete flag is set before the transfer");
+    result_t t = boot_to_download(&pos);
+
+    if (t != T_PASS) {
+        return t;
+    }
+    S.app_steps = 0;
+    xm_result_t x = xm_send_stream(app_image(), sent, g_app_len, crc16_xmodem(app_image(), g_app_len), &pos);
+
+    t = refused_transfer(&x, pos, "IC");
+    if (t == T_PASS) {
+        info("%zu of %u bytes sent, trailer claims %u: refused, flag kept, application not run, not started after a reset", sent,
+             g_app_len, g_app_len);
+    }
+    return t;
+}
+
+/* 23. A complete transfer whose trailer carries the wrong CRC is refused with status 'C'. */
+static result_t test_23(void) {
+    size_t pos;
+    const size_t len = 4 * FRAME_BYTES;
+
+    boot_open(false, KEY_ARROWS);
+    boot_snapshot();
+    const uint8_t *ee = eeprom_array();
+
+    REQUIRE(ee != NULL && ee[EE_BOOT_XFER] != EE_BOOT_XFER_ACTIVE, "internal: the incomplete flag is set before the transfer");
+    result_t t = boot_to_download(&pos);
+
+    if (t != T_PASS) {
+        return t;
+    }
+    S.app_steps = 0;
+    xm_result_t x = xm_send_stream(app_image(), len, (uint32_t)len, (uint16_t)(crc16_xmodem(app_image(), len) ^ 0x0001u), &pos);
+
+    t = refused_transfer(&x, pos, "C");
+    if (t == T_PASS) {
+        info("%zu bytes sent whole, trailer CRC off by one bit: refused with FAIL C, flag kept, not started after a reset", len);
+    }
+    return t;
+}
+
+/* ------------------------------------------------------------------------------------------------ */
 
 typedef struct {
     int num;
     const char *name;
     result_t (*fn)(void);
 } test_t;
+
+/* ORIGINAL_BUGS #100, the boot loader's serial link. The original ran 12 MHz / (16 x (18+1)) = 39473.7 baud
+ * against a host's 38400 -- +2.8 %, the same arithmetic defect as #90 in the application -- and framed with
+ * two stop bits. Both are now fixed, and this test pins the registers so neither can come back.
+ *
+ * The figures: with U2X the divisor is 8 instead of 16, so UBRR1 = 38 gives 12e6 / (8 x 39) = 38461.5 baud,
+ * which is +0.16 % against 38400. A UART tolerates a few per cent, so +2.8 % did not stop the original
+ * working -- which is exactly why a defect like this survives unless something asserts the number.
+ *
+ * The registers are read after the loader has reached its download prompt, so they are the values it
+ * actually configured, not power-on defaults. */
+static result_t test_24(void) {
+    size_t pos;
+
+    boot_open(false, KEY_ARROWS);
+    result_t t = boot_to_download(&pos);
+
+    if (t != T_PASS) {
+        return t;
+    }
+
+    const uint8_t *d = S.avr->data;
+    const unsigned ubrr = (unsigned)d[ADDR_UBRR1L] | ((unsigned)(d[ADDR_UBRR1H] & 0x0Fu) << 8);
+    const bool u2x = (d[ADDR_UCSR1A] & 0x02u) != 0;
+    const unsigned stop = 1u + ((d[ADDR_UCSR1C] >> 3) & 1u);
+    const unsigned ucsz = ((d[ADDR_UCSR1C] >> 1) & 3u) | (unsigned)(((d[ADDR_UCSR1B] >> 2) & 1u) << 2);
+
+    REQUIRE(u2x, "the loader did not set U2X1: the divisor is 16, not 8");
+    REQUIRE(ubrr == 38u, "UBRR1 is %u, expected 38", ubrr);
+    REQUIRE(stop == 1u, "the loader framed with %u stop bits, expected 1", stop);
+    REQUIRE(ucsz == 3u, "the loader set UCSZ %u, expected 3 (8 data bits)", ucsz);
+
+    /* The arithmetic the two constants above stand for, asserted as a number so a future edit that keeps
+     * U2X but changes UBRR is caught too. */
+    const double baud = 12000000.0 / (8.0 * (double)(ubrr + 1u));
+    const double error_pct = (baud - 38400.0) / 38400.0 * 100.0;
+
+    REQUIRE(error_pct > -1.0 && error_pct < 1.0, "the loader runs at %.1f baud, %+.2f %% from 38400", baud,
+            error_pct);
+
+    /* The debug echoes the original emitted ("o", "@", "n") are gone. This cannot be checked by scanning
+     * the whole stream for those letters -- the banner itself is "Press ENTER to download, others run
+     * app.", which contains both an 'o' and an 'n'. The first version of this test did exactly that and
+     * failed on the banner's own text.
+     *
+     * What is checked instead is the part of the stream where only the protocol may speak: once the loader
+     * is at its download prompt it sends the XMODEM-CRC request 'C' and nothing else until a frame
+     * arrives. A stray echo there would corrupt what a host is parsing. */
+    size_t prompt_from = pos;
+
+    (void)run_for(SEC(2));
+    REQUIRE(S.rx_len > prompt_from, "the loader sent nothing further at its download prompt");
+    for (size_t i = prompt_from; i < S.rx_len; i++) {
+        const uint8_t c = S.rx_buf[i];
+
+        REQUIRE(c == (uint8_t)'C', "at the download prompt the loader sent 0x%02X ('%c') at offset %zu; only "
+                                   "the XMODEM-CRC request 'C' belongs here",
+                c, (c >= 0x20u && c < 0x7Fu) ? (char)c : '.', i);
+    }
+    return T_PASS;
+}
 
 static const test_t TESTS[] = {
     {1, "boot: no key held, application starts, no banner", test_01},
@@ -2735,6 +3432,11 @@ static const test_t TESTS[] = {
     {17, "zero cal: the front end is restored after every capture", test_17},
     {18, "zero cal: one capture per pass, key scan, display and *IDN? keep being serviced", test_18},
     {19, "relay exercise: patterns step at least 1.5x faster, guard read at least once a second, input stops it", test_19},
+    {20, "panel: BRIGHT offers 8 choices shown 1-8, ENTER sends 0x88-0x8F to both controllers, choice kept after reset", test_20},
+    {21, "panel: SHIFT reference editors clear the minus flag and lamps, both exits redraw the reading and the flag", test_21},
+    {22, "boot: truncated transfer (trailer claims more than was sent) refused, flag kept, app not run", test_22},
+    {23, "boot: complete transfer with a wrong trailer CRC refused with FAIL C, flag kept, app not run", test_23},
+    {24, "boot: link is 38461.5 baud (U2X, UBRR1 38), 8 data bits, 1 stop bit, no debug echoes", test_24},
 };
 
 int main(int argc, char **argv) {

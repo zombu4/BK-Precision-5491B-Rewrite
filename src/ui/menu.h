@@ -9,10 +9,11 @@
  * A baud / echo / terminator change is applied consistently through settings_apply(),
  * not only when it is stored (the original applied them inconsistently).
  *
- * SYS item 7 ZERO CAL: the original capture routine (0x1B76) wrote bad user-zero tables on one meter and
- * the cause is not established -- firmware defect or operator/short quality (UNVERIFIED). The port refuses an
- * implausible captured zero, and entry is behind the service unlock entered on the panel through the KEY
- * prompt.
+ * SYS item 7 ZERO CAL: an open question. The original capture routine (0x1B76) wrote bad
+ * user-zero tables on one meter and the cause is not established -- firmware defect or
+ * operator/short quality. DO NOT port that path until re-analyst reports. When it is ported, entry is
+ * behind a service unlock entered on the panel through the existing KEY prompt, NOT the fixed code 6666.
+ *
  */
 #ifndef BK_MENU_H
 #define BK_MENU_H

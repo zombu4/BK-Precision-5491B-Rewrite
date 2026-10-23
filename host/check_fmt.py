@@ -184,7 +184,10 @@ def oracle_parse_float(text: str):
             exponent = -int(ds) if exp_neg else int(ds)
             i = j
         else:
-            i = i + 1 + (1 if (i + 1 < n and text[i + 1] in "+-") else 0)
+            # ORIGINAL_BUGS #21, fixed at src/fmt/fmt.c:683-687: an exponent marker with no digits after it
+            # ("1e", "1e+", "1e-") is a syntax error. The oracle used to skip the marker and the sign and
+            # carry on, which made it agree with the defect rather than with the fix.
+            return 1, None
     value = Decimal(mant + frac or "0").scaleb(exponent - len(frac))
     if value == 0:
         return 0, 0.0

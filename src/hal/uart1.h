@@ -3,7 +3,8 @@
  *
  * The original ran a whole command line with interrupts disabled and stalled 1 s on an
  * error, losing bytes. Here the RX ISR only enqueues; the parser drains the buffer in the main loop.
- * Echo (settings.echo) is applied by the ISR, exactly as the original did, so timing is unchanged.
+ * Echo (settings.echo) is queued by the ISR. Replies and echo share one transmit ring emptied by the UDRE
+ * interrupt: uart1_putc() returns as soon as the byte is queued and only waits when the ring is full.
  */
 #ifndef BK_UART1_H
 #define BK_UART1_H

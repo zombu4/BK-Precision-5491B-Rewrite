@@ -1,6 +1,6 @@
 /* fmt.h -- number formatting and scanning. PROTOCOL-VISIBLE. FROZEN.
  *
- * Why this module exists: the original runtime cannot simply be replaced by avr-libc. The
+ * Why this module exists: a10 cannot simply be replaced by avr-libc. The
  * original parser used ICC atof (0x13DC0) and sscanf (0x14C86); avr-libc strtod behaves differently
  * (1e39 becomes inf, not 1.2e-38). So the accept/reject set is reproduced here by hand.
  *
@@ -9,10 +9,11 @@
  * output at all are fixed: %e of 0.0 printing nothing, zero-padding before the minus sign, and the
  * 24-bit fraction error (1e-5 printing as 9.9e-6).
  *
- * INPUT: the accepted grammar is kept. Two deliberate differences: an out-of-range exponent is
+ * INPUT: the accepted grammar is kept. Three deliberate differences: an out-of-range exponent is
  * a NORMAL ERROR instead of silently yielding a wrong value (the original stored 1e39 as 1.2e-38, which
- * can corrupt a :SCAL:COEF value), and text that is not a number at all is a syntax error instead of the
- * value 0.0 that the caller then reported as a zero parameter.
+ * can corrupt a :SCAL:COEF value), text that is not a number at all is a syntax error instead of the
+ * value 0.0 that the caller then reported as a zero parameter, and an exponent marker with no digits
+ * ("1e", "1e+", "1e-") is a syntax error instead of exponent 0 (ORIGINAL_BUGS #21).
  *
  * A numeric parameter of ZERO IS ACCEPTED wherever the
  * parameter's range allows it, because every pre-existing defect is fixed. So

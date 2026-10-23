@@ -42,8 +42,16 @@ return at once, so nothing rewrites the flag byte at 0x1B (cell 9); no text path
 sit at the third byte of cells 0-9 and the menu writes only SHIFT and TRIG. The one exception is the SELF TEST
 lamp phase, which lights all 12 cells (`lamp_test_on`) and is cleared by `display_clear_all()` in
 `start_key_test`. So cells 9-11 are blank and no text may use them: the printers stop at 9.
-UNVERIFIED: that the tube has a visible grid at cells 10 and 11 of the main controller and at cell 10 of the
-second -- check: look at the SELF TEST lamp phase on a unit.
+
+**The tube has nine grids per line and no more (counted on the glass, 2026-10-23).** The SELF TEST lamp
+phase with every segment lit was photographed.
+Counted on the glass, each line carries exactly **nine** 14-segment character cells, and **every** cell
+including the ninth has its own small `:` and `.` to its right, between it and the next cell. There is no
+visible grid at main cells 10-11 or at second cell 10 — those addresses exist in the controller's RAM and
+drive nothing on the panel, which is consistent with 0x1B being the flag byte. The
+earlier UNVERIFIED on this point is answered and withdrawn. Consequence for text: nine cells is the hard
+limit on both lines, not a convention, and the marks after the ninth cell cannot be used to carry a
+character.
 
 **Two lines.** A name that does not fit one line in full takes both: main line, then second line, each at most
 9 cells. An editor shows its value on the main line and the name of what it edits on the second line.
@@ -101,15 +109,15 @@ as the second-line name of the RELAY POWER ON editor, where the value is on the 
 
 The original put a prompt before the value (`HI:`, `R.F:`, `RDGS:`) and padded to a fixed cell. That left two
 to four cells for the value, and `R.F:` for "reference" is the vendor's squeeze to fit. Now every editor shows
-the value from cell 0 and the name on the second line.
+the value from cell 0 and the name on the second line, except the two reference editors, which put `REF:` first (below).
 
 | Editor | Old screen (prompt + value) | New main line | New second line | Main cells | Second cells |
 |---|---|---|---|---|---|
 | HI LIMIT | `HI:` + number | number (`+1.0000k`) | `HI LIMIT` | 7 | 8 |
 | LO LIMIT | `LO:` + number | number | `LO LIMIT` | 7 | 8 |
 | PERC REF | blank + number | number | `PERC REF` | 7 | 8 |
-| dB REF | `R.F:` + number | number | `dB REF` | 7 | 6 |
-| dBm REF | `REF:` + 4 digits + `&` | `0600&` | `dBm REF` | 5 | 7 |
+| dB REF | `R.F:` + number | `REF:` + number without its sign (`REF:1.0000^`) | `dB REF` | 9 | 6 |
+| dBm REF | `REF:` + 4 digits + `&` | `REF:` + 4 digits + `&` (`REF:0600&`) | `dBm REF` | 8 | 7 |
 | HOLD CNT | `RDGS:` + 3 digits | `004` | `HOLD CNT` | 3 | 8 |
 | CAL reference value | `R.F:` + number | number | `REFERENCE` | 7 | 9 |
 | TRIG MODE | `SOURCE:` + `IMM` / `MAN` / `BUS` | `IMMEDIATE` / `MANUAL` / `BUS` | `TRIG MODE` | 9 / 6 / 3 | 9 |
@@ -121,7 +129,7 @@ the value from cell 0 and the name on the second line.
 | KEY SOUND | `SOUND:` + `ON`/`OFF` | `ON` / `OFF` | `KEY SOUND` | 2 / 3 | 9 |
 | RELAY POWER ON | `BOOT:` + `ON`/`OFF` | `ON` / `OFF` | `RELAY PWR` | 2 / 3 | 9 |
 | LINE FREQ | `LINE:` + `60HZ`/`50HZ` | `60 HZ` / `50 HZ` | `LINE FREQ` | 5 | 9 |
-| BRIGHT | `LVL:` + `10/16` ... `14/16` | `10/16` ... `14/16` | `BRIGHT` | 5 | 6 |
+| BRIGHT | `LVL:` + `10/16` ... `14/16` | `1` ... `8` (eight choices, one per dimming code of the display chip; `1` dimmest, `8` brightest) | `BRIGHT` | 1 | 6 |
 | CAL function | `FUNC:` + `DCV`/`DCA`/`OHM` | `DCV` / `DCA` / `OHM` | `FUNCTION` | 3 | 8 |
 | CAL range (V) | `RANG:1000V` ... `RANG:500mV` (9 cells) | `1000V` `500V` `50V` `5V` `500mV` | `RANGE` | 2-5 | 5 |
 | CAL range (A) | `RANG: 20A` ... `RANG: 5mA` | `20A` `5A` `500mA` `50mA` `5mA` | `RANGE` | 2-5 | 5 |
@@ -132,6 +140,36 @@ the value from cell 0 and the name on the second line.
 
 `&` is the ohm glyph (`glyph_symbol[8]` = 0xA315). The number editors show `sign, five digits, a point, the
 SI prefix` = 7 cells (the point shares a cell); the prefix `^` means "no prefix" and is a blank cell.
+
+**The two reference editors carry the label `REF:`** on the main line in front of the value, because the
+second line names the editor (`dB REF` or `dBm REF`) and the label says what the number is. Cell counts by the
+rule in section 1, `:` sharing the cell of the `F`:
+
+| Row | Characters | Cells |
+|---|---|---|
+| dB REF | `REF:` 3 + five digits 5 (the point shares the cell before it) + the prefix cell 1 | 9 |
+| dB REF with the unit `V` | the row above + `V` 1 | 10, over the 9-cell line, so the unit is **not shown** |
+| dBm REF | `REF:` 3 + four digits 4 + the ohm glyph 1 | 8 |
+
+The dB reference is a voltage and is never negative, so its editor has **no sign position**: the cursor starts
+on the first digit and never reaches the sign cell, and the row starts with `REF:` and not with `+`. HI LIMIT,
+LO LIMIT and PERC REF keep their sign cell. `host/test_menu_text.c` (`reference_editors()`) checks both rows, the
+sign cell and the cursor limits.
+
+**Lamp rule, one for every editor, whether it is opened from the menu or from SHIFT.** The panel is cleared on
+entry (`display_clear_all()`, original `0xE31C`), so no measurement lamp, no minus sign and no secondary text
+stays lit behind an editor. Inside the editor only two lamps are ever lit: SHIFT while the operator has pressed
+SHIFT inside the menu, and TRIG after a TRIG MODE choice was entered. When the editor closes, confirmed or
+cancelled, `release_display()` redraws the whole measurement screen. Evidence from the original: after
+`display_clear_all()` (`0x1FD4`, which writes display memory only and leaves the shadows alone) `0xE320-0xE336`
+masks the two flag-byte shadows `0x0F57` and `0x0F56` with `0x13` and writes them back to the controllers, and
+the only writers of those shadows set `0x20` (minus), `0x0C` (DC), `0xC0` (AC) or `0xCC` (`0x20FC`, `0xF3E4`,
+`0xF3F8`, `0xF44A`, `0xF45E`, `0x16AB8`; `0xF330` keeps bits 0 and 1 of a value that never has them), so the
+mask leaves the flag byte at zero. The shortcut editors (SHIFT+ACDC, SHIFT+DIODE, SHIFT+REL) did not clear the panel before this change, and
+photographs of the panel (a `-` in front of `R`) show the
+measurement's minus sign behind the editor. They now clear it exactly as `menu_enter()` does. UNVERIFIED: which
+lamps the original leaves lit inside its three shortcut editors -- check: trace `0x5B5C`, `0x60BA`, `0x63A4`
+for a clear or a flag-byte write; the rule above is the one chosen for the rewrite.
 
 ## 4. Prompts, messages, running screens, views
 

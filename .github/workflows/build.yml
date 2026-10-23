@@ -58,7 +58,7 @@ jobs:
       - name: Collect files
         run: |
           mkdir -p dist
-          cp build/5491B-rewrite-full.hex build/5491B-rewrite-app.hex build/5491B-rewrite-full.bin build/SHA256SUMS dist/
+          cp build/5491B-rewrite-full.hex build/5491B-rewrite-app.hex build/5491B-rewrite-app-xmodem.bin build/5491B-rewrite-full.bin build/SHA256SUMS dist/
           cp LICENSE THIRD_PARTY_NOTICES.md LICENSES/avr-libc-2.2.0-LICENSE.txt dist/
           cat dist/SHA256SUMS
 

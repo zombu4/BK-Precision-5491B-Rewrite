@@ -544,8 +544,9 @@ static void shifted_limit(void) {
 }
 
 /* SHIFT+TRIG (0xE2AC-0xE2E0) is HOLD. Every key clears HOLD on entry (0xDB86), so the toggle that the original
- * performs here always ends with HOLD on. In manual-trigger mode TRIG never gets here: 0xDC0A takes it first
- * (ORIGINAL_BUGS 81: confirmed by that trace, HOLD cannot be set from the panel in that mode). */
+ * performs here always ends with HOLD on. The original's manual-trigger test at 0xDC0A took the key before
+ * SHIFT was looked at, so HOLD could not be set from the panel in that mode (ORIGINAL_BUGS 81); keys_dispatch()
+ * now tests SHIFT first. */
 static void shifted_hold(void) {
     meas_hold_arm();
     display_annunciators();
@@ -647,7 +648,9 @@ void keys_dispatch(uint8_t key) {
         display_annunciators();
         return;
     }
-    if (key == KEY_TRIG && g_state.trigger == TRIG_MAN) {
+    /* SHIFT is looked at first: SHIFT+TRIG is HOLD in every trigger mode, a plain TRIG triggers in manual mode
+     * (ORIGINAL_BUGS 81: the original took the key before it looked at SHIFT). */
+    if (key == KEY_TRIG && !g_state.shift_active && g_state.trigger == TRIG_MAN) {
         g_state.manual_trigger_req = true;
         return;
     }

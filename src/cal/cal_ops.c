@@ -16,7 +16,6 @@
 #include "cal.h"
 
 #include <avr/pgmspace.h>
-#include <avr/wdt.h>
 #include "../fmathf.h"
 #include "../main.h"
 #include <stdbool.h>
@@ -236,8 +235,7 @@ static cal_coef_result_t plan_acv(coef_plan_t *plan, const cal_coef_t *c) {
             return CAL_COEF_BAD_RANGE;
         }
     } else if (c->a == 1u) {
-        if (!plan_wire_pairs(plan, FUNC_ACV, c->b, CAL_PAIR_LOW1, c) ||
-            !plan_low_set2(plan, FUNC_ACV, c)) {
+        if (!plan_wire_pairs(plan, FUNC_ACV, c->b, CAL_PAIR_LOW1, c) || !plan_low_set2(plan, FUNC_ACV, c)) {
             return CAL_COEF_BAD_RANGE;
         }
     } else if (!plan_wire_pairs(plan, FUNC_ACV, c->b, CAL_PAIR_LOW3, c)) {
@@ -350,7 +348,7 @@ cal_coef_result_t cal_coef_write(func_t f, const cal_coef_t *c) {
  * every long calibration operation instead of two that could disagree. The menu was written that way and
  * it is the right shape: a panel calibration must not block the loop while the meter settles and the
  * operator reads a reference meter. */
-typedef enum { SWEEP_SHORT = 0, SWEEP_OPEN, SWEEP_RANGE, SWEEP_VERIFY } sweep_kind_t;
+typedef enum { SWEEP_SHORT = 0, SWEEP_OPEN, SWEEP_RANGE, SWEEP_VERIFY, SWEEP_STD, SWEEP_TEST } sweep_kind_t;
 
 /* The function and range cells each sweep covers, in the order the original visits them: SHOR is DCV 0..4, OHM 0..5, then ACV range 4; OPEN is DCA 0..4, then ACA range 4. */
 typedef struct {
@@ -380,8 +378,9 @@ static bool cell_allowed(sweep_kind_t kind, func_t f, uint8_t range) {
         return (f == FUNC_DCA && range < EE_DCA_RANGES) || (f == FUNC_ACA && range == CAL_AC_LOW_RANGE);
     }
 
-    /* The panel flows. The SWEEP_OPEN return above permits only DC A and AC A, so the panel flows need
-     * their own test. The scope is DC V, DC A and ohms; AC stays with BK-Calibrator. */
+    /* The panel flows. They used to fall into the SWEEP_OPEN return above, which permits
+     * only DC A and AC A -- so panel RANGE and VERIFY refused DC V and ohms, two of the three functions
+     * the panel calibration scope names. The scope is DC V, DC A and ohms; AC stays with BK-Calibrator. */
     return (f == FUNC_DCV && range < EE_DCV_RANGES) || (f == FUNC_DCA && range < EE_DCA_RANGES) ||
            (f == FUNC_OHM && range < EE_OHM_RANGES);
 }
@@ -497,7 +496,7 @@ static struct {
     bool once;       /* a ONCE form: exactly the cell below, no walk over the groups */
     bool first_cell; /* the sweep's opening dummy conversions are still owed */
     uint8_t group;
-    func_t func;     /* the cell in hand */
+    func_t func; /* the cell in hand */
     uint8_t range;
     cell_step_t step;
     uint16_t settle_left; /* conversions still to discard before the measurement */
@@ -518,6 +517,16 @@ static struct {
     rate_t range_rate;
     float range_measured;
     float range_change;
+
+    /* :SCAL:STD and :SCAL:TEST. They are driven by the same task as the sweeps and for the same
+     * reason, so they share the state, the step and the settle counter above. `value` is indexed by rate:
+     * all three for STD, element 0 for TEST. */
+    struct {
+        float value[RATE_COUNT];
+        uint8_t rate;      /* STD: the rate being measured */
+        bool ac;           /* STD: the AC kind */
+        rate_t saved_rate; /* TEST: the rate to put back */
+    } query;
 } sweep;
 
 static const sweep_group_t *groups_of(sweep_kind_t kind) {
@@ -560,14 +569,29 @@ static bool next_cell(void) {
  * front end goes back to what the instrument is displaying, and releasing the converter invalidates the
  * measurement pass, so the next one reloads its own coefficients and settles again (meas_release). */
 static void sweep_finish(cal_sweep_state_t result) {
-    (void)meas_frontend_apply(sweep.saved.func, sweep.saved.range);
-    meas_release();
+    if (sweep.kind == SWEEP_TEST) {
+        meas_set_rate(sweep.query.saved_rate); /* TEST forced the medium rate; nothing was claimed */
+    } else {
+        /* STD changes no front end, so there is nothing to restore for it, only the claim to give back. */
+        if (sweep.kind != SWEEP_STD) {
+            (void)meas_frontend_apply(sweep.saved.func, sweep.saved.range);
+        }
+        meas_release();
+    }
     sweep.state = result;
 }
+
+static void std_front_end(void);
+static void std_measure(void);
+static void test_step(void);
 
 static void cell_front_end(void) {
     uint16_t settle;
 
+    if (sweep.kind == SWEEP_STD) {
+        std_front_end();
+        return;
+    }
     if (!cell_allowed(sweep.kind, sweep.func, sweep.range)) {
         sweep_finish(CAL_SWEEP_FAILED); /* nothing is measured, nothing is written */
         return;
@@ -586,7 +610,7 @@ static void cell_front_end(void) {
      * `load_sweep_set` substitutes the identity pair and a zero of 0.0, as the original does.
      *
      * A PANEL flow is asking "what does this instrument READ right now", because `cal_range_commit` scales
-     * the stored coefficient by the ratio reference : measured and `cal_verify` compares the reading against the
+     * the stored coefficient by reference over measured and `cal_verify` compares the reading against the
      * published specification. Both of those are statements about the CORRECTED reading. Measuring through
      * the identity gave an uncorrected number that the commit then treated as corrected: on the dump of a
      * calibrated meter that writes DC V range 0 as 1.049 where the right answer is 1.024, a 2.4 % error written into
@@ -626,6 +650,10 @@ static void cell_measure(void) {
     float z[RATE_COUNT];
     uint8_t i;
 
+    if (sweep.kind == SWEEP_STD) {
+        std_measure();
+        return;
+    }
     if (!meas_average_with(&sweep.set, CAL_SWEEP_RESULT_SAMPLES, &value)) {
         sweep_finish(CAL_SWEEP_FAILED);
         return;
@@ -636,17 +664,16 @@ static void cell_measure(void) {
      * what the instrument currently reads -- not about what it would read uncorrected. */
     if (sweep.kind == SWEEP_RANGE || sweep.kind == SWEEP_VERIFY) {
         if (sweep.kind == SWEEP_VERIFY) {
-            sweep.result_valid =
-                cal_verify(sweep.func, sweep.range, value, sweep.reference, &sweep.deviation,
-                           &sweep.within_spec);
+            sweep.result_valid = cal_verify(sweep.func, sweep.range, value, sweep.reference, &sweep.deviation,
+                                            &sweep.within_spec);
             sweep_finish(sweep.result_valid ? CAL_SWEEP_DONE : CAL_SWEEP_FAILED);
         } else {
             /* The operator sees the change before anything is written. The sweep only measures and
              * previews; cal_range_confirm() commits the point that was previewed. */
             sweep.range_measured = value;
-            sweep.range_pending = cal_range_preview(sweep.func, sweep.range, sweep.range_rate, value,
-                                                    sweep.reference, sweep.accept_cold,
-                                                    &sweep.range_change) == CAL_RANGE_OK;
+            sweep.range_pending =
+                cal_range_preview(sweep.func, sweep.range, sweep.range_rate, value, sweep.reference,
+                                  sweep.accept_cold, &sweep.range_change) == CAL_RANGE_OK;
             sweep_finish(sweep.range_pending ? CAL_SWEEP_DONE : CAL_SWEEP_FAILED);
         }
         return;
@@ -720,6 +747,10 @@ bool cal_open_all_start(void) {
 
 cal_sweep_state_t cal_sweep_task(void) {
     if (sweep.state != CAL_SWEEP_RUNNING) {
+        return sweep.state;
+    }
+    if (sweep.kind == SWEEP_TEST) {
+        test_step();
         return sweep.state;
     }
     switch (sweep.step) {
@@ -855,13 +886,21 @@ bool cal_range_confirm(void) {
     return ok;
 }
 
-/* ---- :SCAL:STD --------------------------------------------------------------------------------------- */
+/* ---- :SCAL:STD and :SCAL:TEST ----------------------------------------------------------------------- */
+
+/* Both used to be blocking calls: about a second for STD (three rates, each with its settle and four
+ * conversions), and as long as a reading takes for TEST. That held the main loop, so the host link, the keys
+ * and the display stopped for the duration (ORIGINAL_BUGS #1, the same defect the sweeps had).
+ * They are now start/poll pairs on the sweep machine: `cal_scal_*_start()` begins, the main loop runs
+ * `cal_sweep_task()`, and the remote layer sends the reply when `cal_sweep_state()` reaches DONE and has
+ * collected the numbers with `cal_scal_*_result()`. */
 
 /* The original measured once at the medium rate and printed the number three times
  * (ORIGINAL_BUGS #55). This measures the current function and range at all three rates and writes nothing.
  * It fills the array BY RATE (v[0] fast, v[1] medium, v[2] slow); the executor prints medium first, since
- * field 1 of the reply is the medium reading -- see cal.h. The converter is not switched by rate, so each rate differs only in
- * the coefficient load -- which, under the identity, matters only through the zero a non-DC V function keeps.
+ * field 1 of the reply is the medium reading -- see cal.h. The converter is not switched by
+ * rate, so each rate differs only in the coefficient load -- which, under the identity, matters only through
+ * the zero a non-DC V function keeps.
  *
  * The identity is set exactly as the original sets it, per kind:
  *   DC: both pairs = (func == DC V ? 1.0 : 0.0, 1.0); the zero is cleared for DC V only, every other
@@ -870,94 +909,154 @@ bool cal_range_confirm(void) {
  *       pair stays as loaded.
  * With AC selected on a function whose form is the linear one the main pair's f0 of 0.0 gives a zero
  * reading; that is what the original computes and it is kept.
- * The AC kind settles 500 ms between the single conversion and the four; the DC kind 10 ms, which is less
- * than one conversion period and is therefore not counted. The converter is claimed for the duration like a
- * sweep's, so a measurement pass cannot take conversions in the middle of the average; the call
- * itself stays blocking, as cal.h says. It changes no front end, so there is nothing to restore. */
-bool cal_scal_std(cal_std_kind_t kind, float out[RATE_COUNT]) {
-    const func_t f = g_state.func;
-    const uint8_t range = g_state.range[f].index;
-    bool ok = true;
-    uint8_t r;
+ * Per rate the conversions discarded are the original's, in one count: 3 dummies at the first rate only,
+ * the single probe conversion, and for the AC kind the 500 ms between the probe and the four (25 conversions
+ * at 20 ms); the DC kind's 10 ms is less than one conversion period and is therefore not counted. Then four
+ * are averaged. The converter is claimed for the duration like a sweep's, so a measurement pass cannot take
+ * conversions in the middle of the average. */
+static void std_front_end(void) {
+    const func_t f = sweep.func;
+    cal_set_t *set = &sweep.set;
+    uint16_t settle = CAL_SWEEP_PROBE_SAMPLES;
+    uint8_t i;
 
-    if (!meas_claim()) {
-        return false;
+    /* A key can now be pressed while this runs. The set below belongs to the function and range STD started
+     * on, so a change of either would pair coefficients with the wrong front end: stop instead. */
+    if (g_state.func != f || g_state.range[f].index != sweep.range) {
+        sweep_finish(CAL_SWEEP_FAILED);
+        return;
     }
-    for (r = 0u; ok && r < RATE_COUNT; r++) {
-        cal_set_t set;
-        float mean = 0.0f;
-        uint8_t i;
-
-        cal_load(f, range, (rate_t)r, &set);
-        set.uzero = 0.0f;
-        if (kind == CAL_STD_DC) {
-            set.main.f0 = (f == FUNC_DCV) ? 1.0f : 0.0f;
-            set.main.f1 = 1.0f;
-            set.alt = set.main;
-            if (f == FUNC_DCV) {
-                set.zero = 0.0f;
-            }
-        } else {
-            set.main.f0 = 0.0f;
-            set.main.f1 = 1.0f;
-            for (i = 0u; i < 3u; i++) {
-                set.low[i] = identity_pair(CAL_FORM_QUAD);
-            }
-            set.zero = 0.0f;
+    cal_load(f, sweep.range, (rate_t)sweep.query.rate, set);
+    set->uzero = 0.0f;
+    if (!sweep.query.ac) {
+        set->main.f0 = (f == FUNC_DCV) ? 1.0f : 0.0f;
+        set->main.f1 = 1.0f;
+        set->alt = set->main;
+        if (f == FUNC_DCV) {
+            set->zero = 0.0f;
         }
-
-        ok = discard_conversions(&set, (r == 0u) ? CAL_DUMMY_CONVERSIONS : 0u) &&
-             discard_conversions(&set, CAL_SWEEP_PROBE_SAMPLES) &&
-             discard_conversions(&set, (kind == CAL_STD_AC) ? CAL_STD_AC_SETTLE_CONVERSIONS : 0u) &&
-             meas_average_with(&set, CAL_SWEEP_RESULT_SAMPLES, &mean);
-        if (ok) {
-            out[r] = mean; /* the gain stage is already applied (meas_average_with) */
+    } else {
+        set->main.f0 = 0.0f;
+        set->main.f1 = 1.0f;
+        for (i = 0u; i < 3u; i++) {
+            set->low[i] = identity_pair(CAL_FORM_QUAD);
         }
+        set->zero = 0.0f;
+        settle = (uint16_t)(settle + CAL_STD_AC_SETTLE_CONVERSIONS);
     }
-    meas_release(); /* the conversions consumed here belong to no pass */
-    return ok;
+    if (sweep.query.rate == 0u) {
+        settle = (uint16_t)(settle + CAL_DUMMY_CONVERSIONS);
+    }
+    sweep.settle_left = settle;
+    sweep.step = CELL_SETTLE;
 }
 
-/* ---- :SCAL:TEST -------------------------------------------------------------------------------------- */
+static void std_measure(void) {
+    float mean;
+
+    if (!meas_average_with(&sweep.set, CAL_SWEEP_RESULT_SAMPLES, &mean)) {
+        sweep_finish(CAL_SWEEP_FAILED);
+        return;
+    }
+    sweep.query.value[sweep.query.rate] = mean; /* the gain stage is already applied (meas_average_with) */
+    sweep.query.rate++;
+    if (sweep.query.rate < RATE_COUNT) {
+        sweep.step = CELL_FRONT_END;
+    } else {
+        sweep_finish(CAL_SWEEP_DONE);
+    }
+}
+
+/* Begins a STD or TEST once the caller has made its own checks. Like a sweep start it forgets any panel point
+ * that was awaiting confirmation, because the state and the cell fields are shared. The function and range
+ * are taken here, once, as the request. */
+static void query_begin(sweep_kind_t kind) {
+    sweep.kind = kind;
+    sweep.range_pending = false;
+    sweep.result_valid = false;
+    sweep.func = g_state.func;
+    sweep.range = g_state.range[g_state.func].index;
+    sweep.query.rate = 0u;
+    sweep.step = CELL_FRONT_END;
+    sweep.state = CAL_SWEEP_RUNNING;
+}
+
+bool cal_scal_std_start(cal_std_kind_t kind) {
+    if (sweep.state == CAL_SWEEP_RUNNING || !meas_claim()) {
+        return false;
+    }
+    query_begin(SWEEP_STD);
+    sweep.query.ac = (kind == CAL_STD_AC);
+    return true;
+}
+
+bool cal_scal_std_result(float out[RATE_COUNT]) {
+    uint8_t r;
+
+    if (sweep.kind != SWEEP_STD || sweep.state != CAL_SWEEP_DONE) {
+        return false;
+    }
+    for (r = 0u; r < RATE_COUNT; r++) {
+        out[r] = sweep.query.value[r];
+    }
+    return true;
+}
 
 /* The original forced the medium rate (leaving it changed), measured with the normal
  * coefficients, and replied the reading with the REL reference subtracted. Here the measurement module takes
  * the reading, so the coefficients are the ones in use by definition; the rate is forced to medium for the
- * reading and put back afterwards. The original measured only functions 0 to 4 (other functions replied a
- * stale value); those other functions are refused here.
- * The loop ends because the measurement module guarantees it: a conversion that never arrives moves the
- * phase to MEAS_FAULT after a bounded wait (meas.h).
+ * reading and put back when the test ends, however it ends (sweep_finish). The original measured only
+ * functions 0 to 4 (other functions replied a stale value); those other functions are refused here.
+ *
+ * The converter is NOT claimed: the reading comes from the normal pass. While a TEST runs the main loop calls
+ * cal_sweep_task() instead of meas_task() (main.c), so test_step() runs the pass itself, one call at a time.
+ * The wait is bounded by the measurement module: a conversion that never arrives moves the phase to
+ * MEAS_FAULT after a bounded wait (meas.h). The one other way the original could wait for ever
+ * was a trigger mode that holds the pass back (manual or bus), with the whole instrument frozen; TEST is
+ * refused there instead.
  * UNVERIFIED: that g_state.reading.calibrated is the value the original replied (RAM 0x0EE5, before the
  * overload test and before dB/dBm) and that rel_t.reference is the base the original subtracted. Check both in meas/meas.c when it exists. */
-bool cal_scal_test(float *out) {
-    const func_t f = g_state.func;
-    const rate_t saved_rate = g_state.rate;
-    bool ok = true;
-
-    if (f > FUNC_OHM) {
+bool cal_scal_test_start(void) {
+    if (g_state.func > FUNC_OHM || g_state.trigger != TRIG_IMM || sweep.state == CAL_SWEEP_RUNNING) {
         return false;
     }
+    query_begin(SWEEP_TEST);
+    sweep.query.saved_rate = g_state.rate;
     meas_set_rate(RATE_MEDIUM);
     meas_invalidate();
-    while (!meas_reading_ready()) {
-        if (meas_phase() == MEAS_FAULT) {
-            ok = false;
-            break;
-        }
-        meas_task();
-        wdt_reset();
+    return true;
+}
+
+static void test_step(void) {
+    const func_t f = sweep.func;
+
+    /* A key can change the function or the rate while the pass runs; the reading would then be of something
+     * else, so it is not reported. */
+    if (g_state.func != f || g_state.rate != RATE_MEDIUM) {
+        sweep_finish(CAL_SWEEP_FAILED);
+        return;
     }
-    if (ok) {
+    meas_task();
+    if (meas_reading_ready()) {
         float value = g_state.reading.calibrated;
 
         if (g_state.rel[f].active) {
             value -= g_state.rel[f].reference;
         }
-        *out = value;
+        sweep.query.value[0] = value;
         meas_take_reading();
+        sweep_finish(CAL_SWEEP_DONE);
+    } else if (meas_phase() == MEAS_FAULT) {
+        sweep_finish(CAL_SWEEP_FAILED);
     }
-    meas_set_rate(saved_rate);
-    return ok;
+}
+
+bool cal_scal_test_result(float *out) {
+    if (sweep.kind != SWEEP_TEST || sweep.state != CAL_SWEEP_DONE) {
+        return false;
+    }
+    *out = sweep.query.value[0];
+    return true;
 }
 
 /* ---- :SCAL:DCV:ZERO and :SCAL:ACV:ZERO ---------------------------------------------------------------- */
@@ -1030,20 +1129,41 @@ bool cal_date_write(const char date[8]) {
 
 /* ---- Boot defaults ----------------------------------------------------------------------------------- */
 
-/* Writes `len` bytes of `text` at `addr`, zero-padded to `len`. The original wrote the literal and then
- * whatever bytes followed it in flash or in a scratch buffer (a dump of a calibrated meter holds such residue at 0x0A02);
- * padding with zeros is the only difference. */
-static bool write_text(uint16_t addr, const char *text, uint8_t len) {
-    char buf[16];
+/* The default image of one :THID field: `text` zero-padded to `len` bytes. The original wrote the literal and
+ * then whatever bytes followed it in flash or in a scratch buffer (a dump of a calibrated meter holds such residue at
+ * 0x0A02); padding with zeros is the only difference. An empty `text` is the image of a zero counter. */
+static void field_image(uint8_t *image, const char *text, uint8_t len) {
     uint8_t i;
 
     for (i = 0u; i < len; i++) {
-        buf[i] = '\0';
+        image[i] = 0u;
     }
     for (i = 0u; i < len && text[i] != '\0'; i++) {
-        buf[i] = text[i];
+        image[i] = (uint8_t)text[i];
     }
-    return ee_write_block(addr, buf, len);
+}
+
+/* Gives one :THID field its default if, and only if, the field provably holds nothing but what an
+ * interrupted default write leaves. The initialiser writes a field in ascending address order and
+ * each byte is verified before the next, so the only states it can leave behind are `k` bytes of the default
+ * followed by erased 0xFF bytes: k = 0 is a blank field, k = len is a finished one. Any other byte means
+ * somebody else wrote this field -- the vendor firmware, a :THID command, a service entry -- and it is left
+ * exactly as it is. False only when a write fails. */
+static bool thid_field(uint16_t addr, const char *text, uint8_t len) {
+    uint8_t image[16];
+    uint8_t k = 0u;
+    uint8_t i;
+
+    field_image(image, text, len);
+    while (k < len && ee_read_u8((uint16_t)(addr + k)) == image[k]) {
+        k++;
+    }
+    for (i = k; i < len; i++) {
+        if (ee_read_u8((uint16_t)(addr + i)) != 0xFFu) {
+            return true; /* foreign data: not ours to touch */
+        }
+    }
+    return k == len || ee_write_block(addr, image, len);
 }
 
 /* Block 2: the user-zero tables, guarded by the word at 0x0894.
@@ -1083,8 +1203,8 @@ static void boot_user_zeros(void) {
  * counters and two member numbers. The original never recorded that it had run, so the block was rewritten
  * at every boot of a unit whose production date had never been set (ORIGINAL_BUGS #108).
  *
- * Stamping 0x0A00 would close the :THID:PROD:DATE write-once
- * window, as the instructions show: 0x048D2
+ * The earlier UNVERIFIED here asked whether stamping 0x0A00 would close the :THID:PROD:DATE write-once
+ * window. IT WOULD, and it has been settled at the instruction level: 0x048D2
  * reads that word, 0x048D8-0x048DE compares it with 0x5554 and branches away when it matches, and only the
  * writing path stamps it at 0x048F4 after storing the date. So that word is the handler's own lock, and
  * stamping it here would permanently prevent a production date from ever being set on a blank unit -- the
@@ -1106,7 +1226,16 @@ static void boot_user_zeros(void) {
  * either guard says so -- 0x0A00 valid (a vendor meter, which is what the vendor's own initialiser checks
  * at 0x0538E-0x053A6) or our marker valid -- and stamp our marker in both cases so later boots take the
  * fast path without re-reading. 0x0A00 is read, never written: #108 stays fixed, the write-once window
- * survives, and no existing meter is touched. */
+ * survives, and no existing meter is touched.
+ *
+ * WHEN BOTH GUARDS ARE FALSE. That is a blank unit, or one whose single guard word lost a bit. The
+ * original, and this function until now, then overwrote every field with its default, so one flipped bit in
+ * a two-byte word re-initialised the identity block of a unit that had been set up. A checksum over the
+ * block cannot repair that here: every legitimate writer of these fields (the :THID handlers in serv/thid.c,
+ * the history counters, the service entries) would have to refresh it on each write, and none of them does,
+ * so a stored checksum would be stale after the first command. Instead each field proves for itself that it
+ * is ours to fill -- see thid_field -- and anything else is left alone. The marker is then stamped, because
+ * every field is now either default, completed, or somebody's data. */
 static void boot_thid(void) {
     static const char serial_placeholder[] = "**-***-*****";
     static const char zero_date[] = "00/00/00";
@@ -1126,11 +1255,11 @@ static void boot_thid(void) {
         ee_read_u16(EE_BOOT_MARK) == EE_BOOT_MARK_VALUE) {
         return;
     }
-    if (!write_text(EE_THID_SERIAL, serial_placeholder, 16u) ||
-        !write_text(EE_THID_PROD_DATE, zero_date, 8u) || !write_text(EE_THID_CAL_DATE, zero_date, 8u) ||
-        !write_text(EE_THID_SERV_DATE, zero_date, 8u) || !ee_write_u16(EE_THID_CAL_COUNT, 0u) ||
-        !ee_write_u16(EE_THID_SERV_COUNT, 0u) || !write_text(EE_THID_CAL_MEMBER, zero_member, 2u) ||
-        !write_text(EE_THID_SERV_MEMBER, zero_member, 2u)) {
+    if (!thid_field(EE_THID_SERIAL, serial_placeholder, 16u) ||
+        !thid_field(EE_THID_PROD_DATE, zero_date, 8u) || !thid_field(EE_THID_CAL_DATE, zero_date, 8u) ||
+        !thid_field(EE_THID_SERV_DATE, zero_date, 8u) || !thid_field(EE_THID_CAL_COUNT, "", 2u) ||
+        !thid_field(EE_THID_SERV_COUNT, "", 2u) || !thid_field(EE_THID_CAL_MEMBER, zero_member, 2u) ||
+        !thid_field(EE_THID_SERV_MEMBER, zero_member, 2u)) {
         return;
     }
     (void)ee_write_u16(EE_BOOT_MARK, EE_BOOT_MARK_VALUE);

@@ -4,7 +4,7 @@
  * interrupt isr_usart1_rx 0x0FAF6.
  *
  * USART1 on PD2/PD3, 8 data bits, 1 stop bit, no parity
- * (UCSR1C = 0x06), receive interrupt enabled, transmit polled.
+ * (UCSR1C = 0x06), receive interrupt enabled. Transmit goes through a ring emptied by the UDRE interrupt.
  *
  * ---- The reason this file is shaped the way it is -------------------------------------------------
  * The original ran a whole command line with interrupts DISABLED: the executor at 0x0FBEA does `cli` on
@@ -34,7 +34,8 @@
  * empty line is ignored instead of running an empty command and lighting REM (#6, which also makes CR LF
  * one terminator).
  *  - One terminator byte per reply, LF by default and CR when EEPROM 0x863 is non-zero, never both.
- *  - A 1 ms pause after each transmitted character.
+ * The original's 1 ms pause after each transmitted character is NOT reproduced (ORIGINAL_BUGS #8, #93; see
+ * the transmit section).
  *
  * ---- Other defects fixed here ---------------------------------------------------------------------------
  *  - ORIGINAL_BUGS #89: the original wrote only the low byte of the baud divisor (UBRR1H forced to 0), so
@@ -114,85 +115,91 @@ static bool line_overlong;
 static bool line_damaged;  /* a byte was lost somewhere in the line being built */
 static bool line_skipping; /* dropping the tail of an over-long line, up to its terminator */
 
-/* ---- Echo ---------------------------------------------------------------------------------------------
- * ORIGINAL_BUGS #5: the original echoed from inside the receive interrupt with a BLOCKING wait on UDRE1
- * (0x0FAF6). Normally that wait is nothing, because an echo runs at the same rate as the input. But if the
- * transmitter happens to be in the middle of a reply when a byte arrives, the handler stalls for a whole
- * character time with interrupts off, and the receive FIFO is two bytes deep -- so a host that talks while
- * a reply is going out can lose input.
+/* ---- Transmit ------------------------------------------------------------------------------------------
+ * ORIGINAL_BUGS #8 and #93. The original paused 1 ms after every reply character with a busy wait (0x01E48),
+ * so a `%.8e` reply blocked the meter for 15 ms or more and the pause throttled every rate above 9600 baud.
+ * This firmware has no such pause.
  *
- * The echo still happens in the interrupt, in order, and in the common case it is still written straight to
- * UDR1, so what a host sees is unchanged. The difference is that the handler never waits: a byte that
- * cannot go out immediately is parked in a small ring and sent by the next interrupt or by the main loop,
- * whichever reaches it first. Order is preserved because every writer drains the ring before writing a new
- * byte directly.
+ * Everything that goes out, reply or echo, passes through one ring that the UDRE interrupt empties, so a
+ * reply never waits for the wire. Echo and reply share the ring on purpose: a reply can never overtake the
+ * echo of the command that asked for it, and only one piece of code, tx_service(), ever writes UDR1.
  *
- * Echo bytes are deliberately NOT paced at 1 ms. That pacing belongs to replies; the
- * original's echo went straight out, and pacing it would make typing feel broken at 600 baud. */
-#define UART1_ECHO_RING 32u
-_Static_assert(UART1_ECHO_RING == 32u, "the index masking below depends on a power-of-two ring");
+ * ORIGINAL_BUGS #5: the original echoed with a blocking wait on UDRE1 inside the receive interrupt. Here the
+ * echo is a ring append; with the ring full the echo is dropped, never waited for, so the receiver is never
+ * stalled.
+ *
+ * Atomicity: the ring indices and UCSR1B are touched from the main loop and from two interrupts. The receive
+ * interrupt runs with interrupts off already (AVR hardware clears I on entry and nothing here sets it), the
+ * UDRE interrupt likewise, and the main loop takes ATOMIC_BLOCK around every access. The UDRE interrupt is
+ * enabled by the code that appends a byte and disabled by tx_service() when the ring runs empty. */
+#define UART1_TX_RING 128u /* a reply is at most 113 characters, so one fits */
+#define UART1_TX_MASK (UART1_TX_RING - 1u)
+_Static_assert((UART1_TX_RING & UART1_TX_MASK) == 0u && UART1_TX_RING <= 256u,
+               "the masking below needs a power-of-two ring that a uint8_t index can address");
 
-static volatile uint8_t echo_ring[UART1_ECHO_RING];
-static volatile uint8_t echo_head;
-static volatile uint8_t echo_tail;
+static volatile uint8_t tx_ring[UART1_TX_RING];
+static volatile uint8_t tx_head;
+static volatile uint8_t tx_tail;
+static volatile bool tx_in_flight; /* a byte has been written to UDR1 since the last flush saw TXC1 */
 
-/* Sends as much parked echo as the transmitter will take, without ever waiting. Safe to call from the ISR
- * and from the main loop: it only ever advances the tail, and both callers hold interrupts off. */
-static void echo_drain(void) {
-    while (echo_head != echo_tail && (UCSR1A & (1u << UDRE1)) != 0u) {
-        UDR1 = echo_ring[echo_tail];
-        echo_tail = (uint8_t)((echo_tail + 1u) & (UART1_ECHO_RING - 1u));
+/* The callers below hold interrupts off, or are interrupt handlers. */
+static bool tx_full(void) {
+    return ((uint8_t)(tx_head + 1u) & UART1_TX_MASK) == tx_tail;
+}
+
+static void tx_push(uint8_t c) {
+    tx_ring[tx_head] = c;
+    tx_head = (uint8_t)((tx_head + 1u) & UART1_TX_MASK);
+    UCSR1B |= (1u << UDRIE1);
+}
+
+/* The only writer of UDR1. Sends one byte if the data register is free, and switches the UDRE interrupt
+ * off when nothing is left to send. Safe to call with interrupts off and the interrupt disabled (a polled
+ * drain), and from the UDRE interrupt itself. */
+static void tx_service(void) {
+    if (tx_head != tx_tail && (UCSR1A & (1u << UDRE1)) != 0u) {
+        UDR1 = tx_ring[tx_tail];
+        UCSR1A |= (1u << TXC1); /* writing 1 clears TXC1: the flush below waits for it to come back */
+        tx_in_flight = true;
+        tx_tail = (uint8_t)((tx_tail + 1u) & UART1_TX_MASK);
+    }
+    if (tx_head == tx_tail) {
+        UCSR1B &= (uint8_t)~(1u << UDRIE1);
     }
 }
 
-static void echo_byte(uint8_t c) {
-    uint8_t next;
-
-    echo_drain(); /* keep the order: anything parked goes first */
-    if (echo_head == echo_tail && (UCSR1A & (1u << UDRE1)) != 0u) {
-        UDR1 = c; /* the common case, identical to the original */
-        return;
-    }
-    next = (uint8_t)((echo_head + 1u) & (UART1_ECHO_RING - 1u));
-    if (next == echo_tail) {
-        return; /* 32 characters behind with echo on: drop it rather than stall the receiver */
-    }
-    echo_ring[echo_head] = c;
-    echo_head = next;
+ISR(USART1_UDRE_vect) {
+    tx_service();
 }
 
-/* ---- Transmit ----------------------------------------------------------------------------------------- */
-
-/* Longest wait for the transmitter to take one byte. The worst legitimate case is a full echo ring (31
- * parked bytes) plus the byte in the shift register and the one in UDR1 at 600 baud, 10 bits / 600 =
- * 16.67 ms each: 33 * 16.67 ms = 550 ms. 20000 steps of 50 us is 1.0 s plus loop overhead, so a transmitter
- * that is merely slow never trips it. Only a transmitter that is not running at all does. */
+/* Longest wait for one free ring slot: one character time at the slowest rate, 10 bits / 600 baud =
+ * 16.67 ms. 20000 steps of 50 us is 1.0 s plus loop overhead, so a transmitter that is merely slow never
+ * trips it. Only a transmitter that is not running at all does, and the byte is then dropped. */
 #define UART1_TX_WAIT_STEP_US 50u
 #define UART1_TX_WAIT_STEPS 20000u
 
+/* Longest wait for the whole ring to empty, for a baud change: a full ring is 127 bytes plus one in the
+ * data register and one in the shift register, 129 * 16.67 ms = 2.15 s at 600 baud. 60000 steps of 50 us
+ * is 3.0 s plus loop overhead. */
+#define UART1_TX_FLUSH_STEPS 60000u
+
 void uart1_putc(char c) {
-    /* Any echo still parked goes out first, so a reply can never overtake the echo of the command that
-     * asked for it. The original's echo blocked, which gave that ordering for free; here it has to be
-     * stated.
-     *
-     * The "is the data register free" test and the write to it are one atomic step. With them
-     * apart, a receive interrupt between the two could echo into UDR1 and the write that follows would
-     * overwrite the echo byte (ATmega128 USART: UDR1 is a single buffer, writing it while UDRE1 is 0
-     * replaces the pending byte).
-     *
-     * The wait is bounded and feeds the watchdog. The watchdog period is 1.8 s at 5 V (armed as
-     * WDTO_2S in main.c); a 113 character reply at 600 baud takes 113 * (16.67 + 1) ms = 2.0 s. */
+    /* The wait is bounded and feeds the watchdog (armed as WDTO_2S in main.c, 1.8 s at 5 V). It
+     * only happens when the ring is full, which a reply of up to 113 characters never makes it. When the
+     * caller has interrupts off, the wait drains the ring by polling instead of waiting for an interrupt that
+     * cannot come. */
     for (uint16_t step = 0u; step < UART1_TX_WAIT_STEPS; step++) {
-        bool sent = false;
+        bool queued = false;
 
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-            echo_drain();
-            if (echo_head == echo_tail && (UCSR1A & (1u << UDRE1)) != 0u) {
-                UDR1 = (uint8_t)c;
-                sent = true;
+            if (!tx_full()) {
+                tx_push((uint8_t)c);
+                queued = true;
+            } else {
+                tx_service();
             }
         }
-        if (sent) {
+        if (queued) {
             return;
         }
         wdt_reset();
@@ -200,18 +207,31 @@ void uart1_putc(char c) {
     }
 }
 
-/* The original paused 1 ms after each transmitted character (0x01E48). That pacing is
- * visible to a host -- it is why a long reply arrives at a steady rate rather than at line speed -- so it
- * is reproduced rather than optimised away. */
-static void putc_paced(char c) {
-    uart1_putc(c);
-    wdt_reset();
-    _delay_ms(1);
+/* Waits until every queued byte has left the shift register. A baud change before that would garble the
+ * tail of a reply. */
+static void tx_flush(void) {
+    for (uint16_t step = 0u; step < UART1_TX_FLUSH_STEPS; step++) {
+        bool done = false;
+
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            tx_service();
+            if (tx_head == tx_tail && (UCSR1A & (1u << UDRE1)) != 0u &&
+                (!tx_in_flight || (UCSR1A & (1u << TXC1)) != 0u)) {
+                tx_in_flight = false;
+                done = true;
+            }
+        }
+        if (done) {
+            return;
+        }
+        wdt_reset();
+        _delay_us(UART1_TX_WAIT_STEP_US);
+    }
 }
 
 void uart1_write(const char *s) {
     while (*s != '\0') {
-        putc_paced(*s++);
+        uart1_putc(*s++);
     }
 }
 
@@ -219,13 +239,13 @@ void uart1_write_P(const char *s_flash) {
     char c;
 
     while ((c = (char)pgm_read_byte(s_flash++)) != '\0') {
-        putc_paced(c);
+        uart1_putc(c);
     }
 }
 
 /* One byte, never CR+LF: LF when EEPROM 0x863 is 0 (the default), CR otherwise. */
 void uart1_write_terminator(void) {
-    putc_paced(g_state.settings.tx_terminator == 0u ? '\n' : '\r');
+    uart1_putc(g_state.settings.tx_terminator == 0u ? '\n' : '\r');
 }
 
 /* ---- Receive interrupt -------------------------------------------------------------------------------- */
@@ -252,8 +272,8 @@ ISR(USART1_RX_vect) {
         lost_pending = true;
     }
 
-    if (g_state.settings.echo) {
-        echo_byte(c);
+    if (g_state.settings.echo && !tx_full()) {
+        tx_push(c); /* a full ring drops the echo rather than stalling the receiver */
     }
 
     next = (uint8_t)(ring_head + 1u);
@@ -324,8 +344,6 @@ bool uart1_line_ready(void) {
     char c;
     bool gap;
 
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { echo_drain(); }
-
     while (!line_complete && ring_pop(&c, &gap)) {
         if (gap) {
             line_damaged = true;
@@ -349,14 +367,14 @@ bool uart1_line_ready(void) {
                 line_damaged = false;
                 continue;
             }
-            /* Design decision (ORIGINAL_BUGS #6): an EMPTY line is ignored -- no command is run
+            /* ORIGINAL_BUGS #6: an EMPTY line is ignored -- no command is run
              * and the remote annunciator is not lit. The original treated it as a line, so a bare CR or LF
              * ran an empty command and lit REM.
              *
-             * This one rule also gives the second half of the decision, that CR LF counts as ONE
+             * This one rule also gives the second half of the rule, that CR LF counts as ONE
              * terminator: the CR ends the command, and the LF that follows it produces an empty line, which
              * is now ignored. No separate CR-LF special case is needed, and a deliberate blank line is
-             * ignored too, which is the same decision applied consistently. */
+             * ignored too, which is the same rule applied consistently. */
             if (line_len == 0u) {
                 continue;
             }
@@ -408,7 +426,7 @@ uint16_t uart1_line_take(char *dst, uint16_t dst_size) {
 
 /* ---- Setup -------------------------------------------------------------------------------------------- */
 
-void uart1_set_baud(uint8_t baud_index) {
+static void apply_baud(uint8_t baud_index) {
     const uint32_t baud = baud_of_index(baud_index);
     uint16_t ubrr;
 
@@ -423,6 +441,11 @@ void uart1_set_baud(uint8_t baud_index) {
     /* Both halves, high first, which is what ORIGINAL_BUGS #89 was about. */
     UBRR1H = (uint8_t)(ubrr >> 8);
     UBRR1L = (uint8_t)(ubrr & 0xFFu);
+}
+
+void uart1_set_baud(uint8_t baud_index) {
+    tx_flush();
+    apply_baud(baud_index);
 }
 
 void uart1_init(uint8_t baud_index) {
@@ -441,11 +464,12 @@ void uart1_init(uint8_t baud_index) {
     line_overlong = false;
     line_damaged = false;
     line_skipping = false;
-    echo_head = 0u;
-    echo_tail = 0u;
 
     UCSR1B = 0u; /* quiet while the divisor changes */
-    uart1_set_baud(baud_index);
+    tx_head = 0u;
+    tx_tail = 0u;
+    tx_in_flight = false;
+    apply_baud(baud_index);
     UCSR1C = (1u << UCSZ11) | (1u << UCSZ10); /* 0x06: 8 data bits, 1 stop bit, no parity */
     UCSR1B = (1u << RXEN1) | (1u << TXEN1) | (1u << RXCIE1);
 }

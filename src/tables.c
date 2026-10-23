@@ -1,7 +1,7 @@
 /* tables.c -- hand-written flash tables of the 5491B application (literal area
  * 0x00B6-0x1B2F).
  *
- * Every table lives in flash (TBL_FLASH); nothing here is copied to RAM.
+ * Every table lives in flash (TBL_FLASH); nothing here is copied to RAM
  * Types and accessors are declared in tables.h.
  * tools/check_tables.py compares each table below with the bytes of the
  * original image at the address named in its heading.
@@ -175,8 +175,8 @@ const uint8_t range_max_index[FUNC_COUNT] TBL_FLASH = {4, 4, 4, 4, 5, 4, 4, 5, 0
  * both an AC and a DC scale, have no row here.
  */
 /* Samples averaged per reading, by rate (state.h declares it; original RAM 0x0106, written at 0x0F046,
- * 0x0F072 and 0x0F096). The per-function exceptions --
- * ohm range 0 uses 10/20/40, continuity 3, the diode function 6 -- live in meas.c because they
+ * 0x0F072 and 0x0F096). The per-function exceptions are --
+ * ohm range 0 uses 10/20/40, continuity 3, the diode function 6 -- and those live in meas.c because they
  * are measurement policy rather than a flash table.
  *
  * In RAM rather than flash on purpose: it is three bytes read on the hot path of every reading, and

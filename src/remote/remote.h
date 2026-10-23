@@ -12,7 +12,7 @@
  * Protected commands call serv_check() first (serv.h).
  *
  * Reply terminator: LF, or CR when g_state.settings.tx_terminator is non-zero.
- * Kept from the original: the :SCAL:SHOR:ONCE / :SCAL:OPEN:ONCE replies end with '!'.
+ * The :SCAL:SHOR:ONCE / :SCAL:OPEN:ONCE replies end with '!'.
  * Number formatting and scanning go through fmt.h -- do not call avr-libc printf/strtod directly,
  * because the reply format is byte-exact and the input accept/reject set is deliberate.
  */
@@ -51,8 +51,8 @@ void remote_reply_P(const char *s_flash);
 void remote_reply_float(float v);
 void remote_reply_int(int32_t v);
 
-/* The front-panel LOCAL action (0xFAD0) -- the only key honoured while remote.
- * It aliases scpi_enter_local(). */
+/* Amendment 2026-10-22: the front-panel LOCAL action (0xFAD0) -- the only key honoured
+ * while remote -- had no home. It belongs here and aliases scpi_enter_local(). */
 void remote_go_local(void);
 
 #endif /* BK_REMOTE_H */

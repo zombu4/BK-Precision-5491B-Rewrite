@@ -136,10 +136,6 @@ void vfd_write_cell(vfd_dev_t dev, uint8_t cell, uint16_t glyph) {
 void vfd_set_brightness(uint8_t level) {
     (void)level;
 }
-uint8_t vfd_brightness_sixteenths(uint8_t level) {
-    static const uint8_t sixteenths[8] = {1u, 2u, 4u, 10u, 11u, 12u, 13u, 14u};
-    return sixteenths[level & 7u];
-}
 
 serv_result_t serv_check(void) {
     return SERV_ALLOWED;
@@ -373,7 +369,7 @@ static void screens(bool blink_on) {
             m.state = MS_NUMERIC;
             m.param = id;
             eng_format(m.text, samples[v]);
-            for (m.cursor = 0; m.cursor < EDIT_TEXT_LEN; m.cursor++) {
+            for (m.cursor = first_cursor(MS_NUMERIC); m.cursor < EDIT_TEXT_LEN; m.cursor++) {
                 check_screen("numeric", id, (unsigned)v * 8u + m.cursor, blink_on);
             }
         }
@@ -471,6 +467,70 @@ static void screens(bool blink_on) {
     }
 }
 
+/* The dB and dBm reference editors: "REF:" in front of the value, nine cells at most, and the dB editor
+ * without a sign cell. Cell counts by tbl_text_cells(), the rule the display prints with:
+ *   dB REF   "REF:" 3 cells (the colon shares F's) + five digits 5 + prefix 1 = 9, so a unit V would make 10;
+ *   dBm REF  "REF:" 3 cells + four digits 4 + the ohm glyph 1 = 8. */
+static void expect_reference_row(const char *what, const char *expected_start, uint8_t expected_cells) {
+    uint16_t glyphs[CAPTURE_MAX];
+    const uint8_t cells = tbl_text_cells(shown_main, false, TEXT_PRINTER_TEXT, glyphs, CAPTURE_MAX - 1u);
+
+    checked++;
+    if (strncmp(shown_main, expected_start, strlen(expected_start)) != 0 || cells != expected_cells ||
+        cells > DISPLAY_TEXT_CELLS) {
+        printf("FAIL  %s: \"%s\" takes %u cells, expected \"%s...\" and %u cells\n", what, shown_main,
+               (unsigned)cells, expected_start, (unsigned)expected_cells);
+        failures++;
+    }
+}
+
+static void reference_editors(void) {
+    static const float db_refs[] = {1e-4f, 1.0f, 600.0f, 1000.0f};
+
+    for (size_t v = 0; v < sizeof db_refs / sizeof db_refs[0]; v++) {
+        memset(&m, 0, sizeof m);
+        g_state.math.db_ref = db_refs[v];
+        start_numeric(NUM_DB_REF);
+        shown_main[0] = '\0';
+        render();
+        expect_reference_row("dB REF", "REF:", 9u);
+        if (strpbrk(shown_main, "+-") != NULL || m.cursor != 1u) {
+            printf("FAIL  dB REF: \"%s\" has a sign cell, or the cursor is on index %u\n", shown_main,
+                   (unsigned)m.cursor);
+            failures++;
+        }
+        for (uint8_t step = 0; step < 2u * EDIT_TEXT_LEN; step++) {
+            m.cursor = text_cursor_step(m.text, first_cursor(MS_NUMERIC), m.cursor, true);
+            if (m.cursor == 0u) {
+                printf("FAIL  dB REF: the cursor reached the sign cell\n");
+                failures++;
+            }
+        }
+        m.cursor = text_cursor_step(m.text, first_cursor(MS_NUMERIC), 1u, false);
+        if (m.cursor != EDIT_TEXT_LEN - 1u) {
+            printf("FAIL  dB REF: LEFT from the first digit went to index %u\n", (unsigned)m.cursor);
+            failures++;
+        }
+    }
+
+    memset(&m, 0, sizeof m);
+    g_state.math.dbm_ref = 75;
+    start_integer(INT_DBM_REF);
+    shown_main[0] = '\0';
+    render();
+    expect_reference_row("dBm REF", "REF:0075&", 8u);
+
+    memset(&m, 0, sizeof m);
+    g_state.math.percent_ref = 1.0f;
+    start_numeric(NUM_PERCENT_REF);
+    shown_main[0] = '\0';
+    render();
+    if (shown_main[0] != '+' || m.cursor != 0u) {
+        printf("FAIL  PERC REF lost its sign cell: \"%s\"\n", shown_main);
+        failures++;
+    }
+}
+
 int main(int argc, char **argv) {
     listing = (argc > 1 && strcmp(argv[1], "--list") == 0);
 
@@ -492,6 +552,7 @@ int main(int argc, char **argv) {
 
     screens(true);
     screens(false);
+    reference_editors();
 
     printf("%u lines measured, %u failures\n", checked, failures);
     return failures == 0u ? 0 : 1;

@@ -1397,7 +1397,13 @@ static void calc_percent(void) {
 
     if (scpi_next_token() == SCPI_TOK_NUMBER) {
         if (math_value_arg(&value)) {
-            g_state.math.percent_ref = value;
+            /* The percent mode divides by this reference, so a zero reference is refused here exactly as
+             * the ACQuire form below refuses a zero reading, with nothing stored (ORIGINAL_BUGS #20, #78). */
+            if (value == 0.0f) {
+                scpi_fail_data();
+            } else {
+                g_state.math.percent_ref = value;
+            }
         }
     } else if (token_is_colon()) {
         scpi_next_token();

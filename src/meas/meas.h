@@ -1,15 +1,19 @@
 /* meas.h -- the measurement chain: front-end switching, conversion, averaging, correction, statistics.
  *
- * Three points about the shape of this interface:
+ * This header follows the original's behaviour, recovered from the firmware. An earlier draft was wrong in
+ * three ways that mattered, and all three are worth stating so the same assumptions are not made again:
  *
- *   - A reading is not one sample: it is N conversions averaged, and only then corrected. (The original's
- *     SINGLE-SAMPLE routine, `meas_read_primary`, is what this port calls `cal_sample`.)
- *   - The measurement CANNOT block: one reading is 60 to 220 ms of conversions, an ohm range-0 slow reading
- *     is 800 ms, and an AC+DC V reading is nearly a second. The original did block -- while it blocked,
- *     the host link was deaf and there was no watchdog. This header is a state machine for that reason.
- *   - The correction is not a pure function of one code: the zero comes off every sample, the gain applies
- *     to the mean, and the add-on stages need the function and the range. That work belongs to cal.c and
- *     is reached through `cal_sample` and `cal_apply`.
+ *   - It offered `meas_read_primary()` as "applies calibration and the user zero". `meas_read_primary` is
+ *     also, confusingly, what the original's SINGLE-SAMPLE routine does, which this port calls
+ *     `cal_sample`. A reading is not one sample: it is N conversions averaged, and only then corrected.
+ *   - It implied a blocking call. The measurement CANNOT block: one reading is 60 to 220 ms of
+ *     conversions, an ohm range-0 slow reading is 800 ms, and an AC+DC V reading is nearly a second. The
+ *     original did block, and that is the other half of ORIGINAL_BUGS #1 -- while it blocked, the host link was deaf and
+ *     there was no watchdog. This header is a state machine for that reason.
+ *   - `meas_counts_to_reading(code, f, range)` suggested the correction is a pure function of one code. It
+ *     is not: the zero comes off every sample, the gain applies to the mean, and the add-on stages need the
+ *     function and the range. That work belongs to cal.c and is reached through `cal_sample` and
+ *     `cal_apply`.
  *
  * ---- One pass, as the instrument does it --------------------------------------
  * The converter free-runs at one conversion per 20.0 ms for every rate; the rates differ only in how many
@@ -73,7 +77,8 @@ typedef enum {
 void meas_init(void);
 
 /* Called from the main loop as often as it likes. It performs AT MOST one conversion's worth of work and
- * returns, so the loop keeps servicing the host link, the keys and the watchdog throughout a reading. */
+ * returns, so the loop keeps servicing the host link, the keys and the watchdog throughout a reading. This
+ * is the structural half of ORIGINAL_BUGS #1 that does not live in uart1.c. */
 void meas_task(void);
 
 meas_phase_t meas_phase(void);
@@ -135,7 +140,7 @@ void meas_minmax_reset(void);
 void meas_hold_arm(void);
 void meas_hold_release(void);
 
-/* ---- The relay exercise ------------------------------------------------------------------
+/* ---- The relay exercise -----------------------------------------------------------
  * Works the relays to clear contact film, which is what a meter that has sat unused needs. Driven from the
  * state machine like everything else here, one step per `meas_task()` call, so the panel countdown and the
  * host link keep running throughout.
@@ -169,7 +174,7 @@ typedef enum {
 
 relay_exercise_result_t meas_relay_exercise_result(void);
 
-/* ---- Line frequency ----------------------------------------------------------------------
+/* ---- Line frequency ---------------------------------------------------------------
  * Sets the converter's decimation so that mains hum is notched -- 767 for 50 Hz, 639 for 60 Hz. Getting it
  * wrong costs noise rejection rather than accuracy, which is why the command is open and not protected.
  *
@@ -220,15 +225,16 @@ void meas_tick_1ms(void);
  * So a sweep claims it. `meas_claim()` aborts any pass in progress and refuses until released;
  * `meas_average_with()` then takes `samples` conversions and returns their corrected mean using the
  * caller's set; `meas_release()` hands the converter back and invalidates the pass so the next one reloads
- * its coefficients. A sweep that fails part-way must still release. */
+ * its coefficients. A sweep that fails part-way must still release.
+ *
+ * `cal_ops.c` is to be switched onto these when `meas.c` exists. */
 bool meas_claim(void);
 void meas_release(void);
 bool meas_average_with(const cal_set_t *set, uint8_t samples, float *out);
 
 /* The 6-conversion average behind the front-panel ZERO CAL capture.
- * The original routine is arithmetically correct, and the
- * cause of the bad values seen on one meter is not decidable from the firmware. What this port adds is
- * a plausibility limit -- a captured zero that is implausible for the range is refused --
+ * The original routine is arithmetically correct; a bad stored zero cannot be explained from the
+ * firmware alone. What this port adds is a plausibility limit -- a captured zero that is implausible for the range is refused --
  * and the signature that the original never wrote for those tables. */
 bool meas_zero_capture(func_t f, uint8_t range, float *out);
 

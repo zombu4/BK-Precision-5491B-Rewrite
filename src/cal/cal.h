@@ -47,7 +47,7 @@
  *      when a valid negative record exists. The negative calibration data can never take effect at all.
  *   2. For ACDCV and the DC-type secondary the original falls back to a gain of 1.0, not to the positive
  *      pair, when the negative record is invalid -- i.e. an uncalibrated negative reading comes out raw.
- * Decision 2026-10-22: the rule is kept as implemented -- the negative pair when
+ * The rule is kept as implemented -- the negative pair when
  * its signature is 0x5554, otherwise the positive pair, on the primary path and on the AC+DC and secondary
  * paths alike. So both differences from the original stand, deliberately: the negative calibration table
  * becomes live rather than being dead data, and an uncalibrated negative reading comes out nearly right
@@ -59,7 +59,7 @@
  * last stored, which on this meter is a cleared record -- and that was harmless only while the firmware
  * ignored it.
  *
- * Defect 15: :SCAL:SHOR:ONCE / :SCAL:OPEN:ONCE must check function AND range before any
+ * :SCAL:SHOR:ONCE / :SCAL:OPEN:ONCE must check function AND range before any
  * write; on a mismatch the caller reports a normal error and NOTHING is written.
  */
 #ifndef BK_CAL_H
@@ -142,6 +142,7 @@ uint16_t cal_zero_address(func_t f, uint8_t range);
 /* ---- Records ------------------------------------------------------------------------------------------ */
 
 bool cal_read_pair(uint16_t addr, ee_pair_t *out);      /* false when the signature is not valid */
+bool cal_pair_usable(func_t f, const ee_pair_t *p);      /* false for a zero gain or a non-finite term */
 bool cal_write_pair(uint16_t addr, float f0, float f1); /* invalidate, data, verify, signature last */
 bool cal_read_zero(uint16_t addr, ee_zero_t *out);
 bool cal_write_zero(uint16_t addr, const float z[RATE_COUNT]);
@@ -307,13 +308,22 @@ typedef enum { CAL_STD_DC = 0, CAL_STD_AC } cal_std_kind_t;
  * The reply LAYOUT is unchanged from the original; only which value lands in which field was ever in
  * question, and the original's three values were identical so it could not have told anyone.
  *
- * This one stays BLOCKING, deliberately. It is three settles plus 3 + 6 + 11 conversions -- of the order of
- * a second, not the thirty of a sweep -- and only the four sweeps are start/poll pairs. If a
- * second of silence turns out to matter on the host link it becomes a start/poll pair like them, and the
- * conversion-counting work in cal_ops.c would carry straight over. */
-bool cal_scal_std(cal_std_kind_t kind, float out[RATE_COUNT]);
+ * START/POLL, like the sweeps (ORIGINAL_BUGS #1). It was a blocking call of about a second; it now runs on the
+ * sweep machine. `cal_scal_std_start()` claims the converter and returns false if it cannot (a sweep or a
+ * panel flow running, converter in use). The main loop runs `cal_sweep_task()`; when `cal_sweep_state()`
+ * reaches CAL_SWEEP_DONE, `cal_scal_std_result()` copies the three readings out (true only for a finished STD)
+ * and the caller sends its reply. FAILED means nothing is to be sent but the error; the converter is released
+ * on every exit. The function and range are those selected at the start. */
+bool cal_scal_std_start(cal_std_kind_t kind);
+bool cal_scal_std_result(float out[RATE_COUNT]);
 
-bool cal_scal_test(float *out);
+/* :SCAL:TEST, the same way: `cal_scal_test_start()` forces the medium rate and begins a reading, and the
+ * state reaches DONE with the REL-corrected value available from `cal_scal_test_result()`. The rate is put
+ * back on every exit. It returns false for a function above ohms, for a trigger mode other than immediate (the
+ * pass would never start), and while a sweep is running. While it runs the main loop calls the sweep task
+ * instead of the measurement task, and the sweep task runs the measurement pass itself. */
+bool cal_scal_test_start(void);
+bool cal_scal_test_result(float *out);
 
 /* :SCAL:DCV:ZERO and :SCAL:ACV:ZERO. Read-only for EEPROM. Functions other than those the original accepts
  * are refused rather than reading from an address computed off the end of a table. */
@@ -378,7 +388,7 @@ bool cal_undo(void);
 typedef void (*cal_check_report_fn)(const char *name, uint16_t addr);
 uint16_t cal_check_all(cal_check_report_fn report);
 
-/* The panel's view of the same scan. `cal_check_run()` performs it and returns how many records
+/* The panel's view of the same scan . `cal_check_run()` performs it and returns how many records
  * are bad; `cal_check_name(i, buf)` then names the i-th of them so the menu can step through the list.
  *
  * `name` is NOT a stable pointer during the scan -- cal_check_all formats it into one buffer and reuses it

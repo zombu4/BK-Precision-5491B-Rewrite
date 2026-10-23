@@ -29,9 +29,29 @@
  *    to overflow, so the two errors do not cancel at the frequencies this meter is usually used at.
  *    FREQ_OVERFLOW_WEIGHT is 65536. **This changes every frequency and period reading by about 15 ppm.**
  *    It is a deliberate change and it moves the readings towards the truth, not away.
- * 2. The wait for the final capture was bounded by a count of 3000 software loop iterations, so how long
- *    the instrument waited depended on what the compiler emitted and on nothing physical. The timeout here
- *    is real time, measured in Timer1 overflows, which are 5.4613 ms each and keep running regardless.
+ * 2. The wait for the final capture was bounded by a count of 3000 software loop iterations (0x0ADE0-0x0ADE6,
+ *    counter in r11:r10 against 0x0BB8), so how long the instrument waited depended on what the compiler
+ *    emitted and on nothing physical (ORIGINAL_BUGS #74). The deadline here is real time, measured in Timer1
+ *    overflows, which are 5.4613 ms each and keep running regardless, and it is armed for the WHOLE
+ *    measurement. Per stage, with W the gate length in overflows (46 / 92 / 184):
+ *      arming -> first edge:    W + 1 overflows. The original's wait for the second edge gave up when the
+ *                               overflow count exceeded W (0x0AD44-0x0AD4A: `cp r12,r2 ; cpc r13,r3 ;
+ *                               brcc` against W in r13:r12), i.e. at W + 1.
+ *      first edge -> second:    W + 1 overflows again. The original allowed W in total from arming to the
+ *                               second edge, so an input slower than about 2 / (W * 5.4613 ms) read zero
+ *                               according to where the first edge happened to fall; the allowance now
+ *                               adapts to the input, which has just shown that it is running.
+ *      second edge -> result:   W + 2 P + 3 overflows, P being the period just measured between the first
+ *                               two edges, in overflows (see capture_edge_two for the arithmetic).
+ *    At 12 MHz W is 46, 92, 184 overflows = 251.2, 502.4 and 1004.9 ms (65536 / 12e6 = 5.4613 ms each), so
+ *    the allowance after the second edge is W + 2 * dovf + 2 + 3 overflows (dovf: whole overflows between the
+ *    first two edges). For a 1 kHz input dovf = 0, so at the slow rate it is 184 + 5 = 189 overflows =
+ *    1032.2 ms. For a 2 Hz input at the slow rate (P = 500 ms = 91.6 overflows, dovf = 91 or 92) it is
+ *    at most 184 + 184 + 5 = 373 overflows = 2037.1 ms; the measurement itself ends at the gate plus about two
+ *    periods, 1004.9 + 1000 = 2004.9 ms.
+ *    The original gave up on the last capture after 3000 iterations of a loop that calls two helpers and
+ *    sometimes the key scan; it counted no time at all, and the previous port's replacement, a fixed
+ *    3000 ms, was checked in meas.c where it could not cover the gate.
  * 3. Period was computed as 1/f with no guard, so an absent or too-slow input divided by zero. In the
  *    original's arithmetic that returned FLT_MAX rather than trapping, which then printed as a
  *    plausible-looking huge number. A zero or missing frequency is now simply "no reading".
@@ -40,7 +60,6 @@
 
 #include <avr/interrupt.h>
 #include <avr/io.h>
-#include <avr/wdt.h>
 #include <util/atomic.h>
 
 #include "../board.h"
@@ -49,32 +68,38 @@
 /* Gate length in Timer1 overflows, per rate: 46 / 92 / 184 for fast / medium / slow. */
 static const uint16_t gate_overflows[RATE_COUNT] = {46u, 92u, 184u};
 
-/* One Timer1 overflow is 65536 / 12 MHz = 5.4613 ms. Used for the real-time timeout, so that the timeout
- * is a duration rather than a loop count. */
-#define FREQ_OVF_US 5461UL
+/* The deadline's allowance beyond the gate and two periods, in Timer1 overflows (5.4613 ms each at 12 MHz).
+ * The result needs three captures after the gate; one is normally pending already, which makes it two
+ * periods. When the input is slow enough that none is, it needs a third period, and the first-edge rule
+ * bounds a period by W + 1 overflows plus the stamping offset, so the third period exceeds the gate by at
+ * most one overflow. The second edge's overflow stamp lies up to one overflow below its time, one more. Two
+ * overflows are therefore the least that never abandons a measurement that could still finish, and the third
+ * is the slack for the capture interrupt to run before the overflow interrupt that would end it. */
+#define FREQ_DEADLINE_MARGIN_OVF 3u
 
 /* Where the capture state machine is. The names follow the original's edge numbering so the code can
  * be compared with it directly. */
 typedef enum {
     FREQ_IDLE = 0,
-    FREQ_WAIT_EDGE2,  /* armed; the first capture is ignored, the second starts the measurement */
-    FREQ_COUNTING,    /* Timer3 running, waiting for the gate to expire */
-    FREQ_DISCARDING,  /* gate expired; two captures are discarded */
-    FREQ_DONE,        /* T5 taken, both timers stopped */
+    FREQ_WAIT_EDGE2, /* armed; the first capture is ignored, the second starts the measurement */
+    FREQ_COUNTING,   /* Timer3 running, waiting for the gate to expire */
+    FREQ_DISCARDING, /* gate expired; two captures are discarded */
+    FREQ_DONE,       /* T5 taken, both timers stopped */
     FREQ_TIMED_OUT
 } freq_state_t;
 
 static volatile freq_state_t state;
-static volatile uint16_t ovf1;        /* Timer1 overflows since arming */
-static volatile uint16_t ovf1_at_t2;  /* the overflow count when T2 was captured */
-static volatile uint16_t ovf1_at_t5;  /* and when T5 was, both corrected for a pending overflow */
-static volatile uint16_t ovf3;        /* Timer3 overflows, i.e. input edges / 65536 */
+static volatile uint16_t ovf1;       /* Timer1 overflows since arming */
+static volatile uint16_t ovf1_at_t1; /* the overflow count at the first edge after arming */
+static volatile uint16_t ovf1_at_t2; /* the overflow count when T2 was captured */
+static volatile uint16_t ovf1_at_t5; /* and when T5 was, both corrected for a pending overflow */
+static volatile uint16_t ovf3;       /* Timer3 overflows, i.e. input edges / 65536 */
 static volatile uint16_t icr_t2;
 static volatile uint16_t icr_t5;
 static volatile uint16_t tcnt3_final;
 static volatile uint8_t discards;
 static volatile uint16_t gate_limit;  /* copied from gate_overflows at arm time */
-static volatile uint16_t timeout_ovf; /* 0 = no limit */
+static volatile uint16_t timeout_ovf; /* the overflow count at which the measurement is abandoned */
 
 /* ---- Capture interrupt mask ---------------------------------------------------------------------------
  * The capture interrupt is live only while an edge is wanted: edge 1 and edge 2 after arming,
@@ -135,6 +160,7 @@ void freq_gate_start(void) {
 
         ovf1 = 0u;
         ovf3 = 0u;
+        ovf1_at_t1 = 0u;
         ovf1_at_t2 = 0u;
         ovf1_at_t5 = 0u;
         icr_t2 = 0u;
@@ -142,7 +168,7 @@ void freq_gate_start(void) {
         tcnt3_final = 0u;
         discards = 0u;
         gate_limit = gate_overflows[rate];
-        timeout_ovf = 0u;
+        timeout_ovf = (uint16_t)(gate_limit + 1u); /* armed with the gate, not after it */
         state = FREQ_WAIT_EDGE2;
 
         TIFR = (1u << ICF1) | (1u << TOV1);
@@ -158,16 +184,20 @@ void freq_gate_abort(void) {
         TCCR3B = 0u;                            /* stop Timer3 */
         capture_irq_disable();
         state = FREQ_IDLE;
-        timeout_ovf = 0u;
         discards = 0u;
     }
 }
 
-bool freq_result_ready(void) {
+freq_gate_t freq_gate_poll(void) {
     freq_state_t s;
 
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { s = state; }
-    return s == FREQ_DONE;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        s = state;
+    }
+    if (s == FREQ_DONE) {
+        return FREQ_GATE_DONE;
+    }
+    return (s == FREQ_IDLE || s == FREQ_TIMED_OUT) ? FREQ_GATE_NO_SIGNAL : FREQ_GATE_RUNNING;
 }
 
 /* ---- Interrupt handlers ------------------------------------------------------------------------------- */
@@ -201,10 +231,21 @@ ISR(TIMER1_CAPT_vect) {
          * T2. */
         if (discards == 0u) {
             discards = 1u;
+            ovf1_at_t1 = ovf_now;
+            /* The input is running: the second edge gets the same allowance the first had. */
+            timeout_ovf = (uint16_t)(ovf_now + gate_limit + 1u);
             break;
         }
         icr_t2 = icr;
         ovf1_at_t2 = ovf_now;
+        /* The deadline for the rest of the measurement: the gate, two periods, and the margin. The period
+         * is the time between the first two edges. Its stamps are (ovf, icr) pairs, so it is
+         *     P = dovf * 65536 + (icr_t2 - icr_t1), the second term lying in (-65536, 65536),
+         * which makes P / 65536 less than dovf + 1, and 2 P / 65536 less than 2 * dovf + 2. The deadline
+         * therefore uses 2 * dovf + 2 overflows for the two periods, with no 32-bit arithmetic in the
+         * handler. */
+        timeout_ovf = (uint16_t)(ovf_now + gate_limit + 2u * (uint16_t)(ovf_now - ovf1_at_t1) + 2u +
+                                 FREQ_DEADLINE_MARGIN_OVF);
         discards = 0u;
         TCNT3 = 0u;
         ovf3 = 0u;
@@ -252,7 +293,7 @@ ISR(TIMER1_OVF_vect) {
          * original's "two discards, then T5" sequence is made of. */
         capture_irq_enable();
     }
-    if (timeout_ovf != 0u && ovf1 >= timeout_ovf &&
+    if (ovf1 >= timeout_ovf &&
         (state == FREQ_WAIT_EDGE2 || state == FREQ_COUNTING || state == FREQ_DISCARDING)) {
         TCCR1B = (1u << ICNC1) | (1u << ICES1);
         TCCR3B = 0u;
@@ -267,40 +308,15 @@ ISR(TIMER3_OVF_vect) {
 
 /* ---- Results ------------------------------------------------------------------------------------------ */
 
-/* Blocks until the measurement finishes or the timeout expires. The timeout is a real duration counted in
- * Timer1 overflows, which is the second half of the frequency-counter fix: the original counted 3000 software iterations, so its
- * timeout was whatever the compiler happened to produce.
- *
- * NOTE for callers: this blocks the main loop for up to a second of gate plus the timeout, exactly as the
- * original did. Nothing is LOST while it blocks, because the receive ring keeps filling (see uart1.c), but no command executes either. The measurement loop should therefore arm with freq_gate_start()
- * and poll freq_result_ready() between its other work, and use this blocking form only where the original
- * also blocked. freq_result_ready() exists for that reason. */
-bool freq_read(float *hz, uint16_t timeout_ms) {
+/* Delivers a finished gate; it never waits (freq_gate_poll() says when to call). The deadline is the Timer1
+ * overflow handler's, armed from freq_gate_start(), so there is nothing to time out here. */
+bool freq_read(float *hz) {
     uint32_t edges;
     uint32_t ticks;
     freq_state_t s;
 
-    if (timeout_ms == 0u) {
-        timeout_ms = FREQ_GATE_TIMEOUT_MS;
-    }
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        const uint32_t limit = ((uint32_t)timeout_ms * 1000UL) / FREQ_OVF_US;
-
-        timeout_ovf = (limit > 0xFFFFUL) ? 0xFFFFu : (uint16_t)limit;
-        if (timeout_ovf == 0u) {
-            timeout_ovf = 1u;
-        }
-    }
-
-    for (;;) {
-        /* The default timeout (3000 ms) is longer than the watchdog period (1.8 s at 5 V, set to
-         * WDTO_2S in main.c), so the wait must feed it. The wait itself is bounded by timeout_ovf above, which
-         * the Timer1 overflow handler enforces. */
-        wdt_reset();
-        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { s = state; }
-        if (s == FREQ_DONE || s == FREQ_TIMED_OUT || s == FREQ_IDLE) {
-            break;
-        }
+        s = state;
     }
     if (s != FREQ_DONE) {
         return false;
@@ -336,10 +352,10 @@ bool freq_read(float *hz, uint16_t timeout_ms) {
 
 /* Period. The original computed 1 / f with no guard; with its arithmetic a zero frequency returned
  * +FLT_MAX, which then printed as a believable large number instead of an error. */
-bool freq_period_read(float *seconds, uint16_t timeout_ms) {
+bool freq_period_read(float *seconds) {
     float hz;
 
-    if (!freq_read(&hz, timeout_ms)) {
+    if (!freq_read(&hz)) {
         return false;
     }
     if (hz <= 0.0f) {

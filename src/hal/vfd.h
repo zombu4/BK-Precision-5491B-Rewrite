@@ -43,7 +43,7 @@ void vfd_read_keyscan(uint8_t out[3]);               /* command 0x42 to controll
  *     100 = 11/16  101 = 12/16  110 = 13/16  111 = 14/16
  *
  * The chip has exactly these 8 steps ("8-Step Dimming Circuitry", datasheet features list). The menu
- * offers all 8, shown as 1 (code 0, 1/16) to 8 (code 7, 14/16): decision 2026-10-23, because
+ * offers all 8, shown as 1 (code 0, 1/16) to 8 (code 7, 14/16), because
  * the top five alone (10/16 to 14/16) gave too little visible change.
  *
  * Power-on state, from the same page: 1/16 pulse width with the display OFF. So the display must be

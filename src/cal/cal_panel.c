@@ -223,8 +223,8 @@ static cal_range_result_t range_compute(func_t f, uint8_t range, rate_t rate, fl
     /* An invalid record is not a reason to refuse: an uncalibrated range is exactly what someone is here to
      * fix. But the starting point must be THE PAIR THE LOADER ACTUALLY APPLIED, not the identity.
      *
-     * Falling back to the identity would be wrong for a cleared NEGATIVE DC record:
-     * the loader's negative-pair fallback copies the POSITIVE pair into the alternate slot
+     * This used to fall back to the identity, and for a cleared NEGATIVE DC record
+     * that is the wrong pair: the loader's fallback copies the POSITIVE pair into the alternate slot
      * (cal.c, `if (!out->alt_valid) out->alt = out->main;`). The reading is then taken through f0 = 1.0242
      * on a calibrated meter while a commit starting from 1.0 would write the point 2.4 % out -- with a
      * valid signature on it, which is the part that makes it dangerous. EVERY DC V negative record in a
@@ -232,7 +232,7 @@ static cal_range_result_t range_compute(func_t f, uint8_t range, rate_t rate, fl
      *
      * `loaded` is the set `cal_load()` resolved a few lines above, fallbacks and all, so taking the pair
      * from it is by construction the pair the measurement went through. */
-    if (!cal_read_pair(addr, &rec)) {
+    if (!cal_read_pair(addr, &rec) || !cal_pair_usable(f, &rec)) {
         const cal_pair_t src = (variant == CAL_PAIR_MAIN) ? loaded.main : loaded.alt;
 
         rec.f0 = src.f0;
@@ -251,9 +251,11 @@ static cal_range_result_t range_compute(func_t f, uint8_t range, rate_t rate, fl
      * means and what the preview promises, and it leaves the curve's SHAPE untouched -- the curvature
      * relative to the linear term is unchanged, because both were multiplied by the same k.
      *
-     * Decision 2026-10-22: this replaces "a one-point trim adjusts the linear term only", which existed to
-     * stop one noisy measurement refitting the curvature. Scaling both terms does not refit it: their RATIO
-     * is unchanged, so the curve moves without bending, and the operator gets the change they confirmed. The linear form needs no special case:
+     * This replaces the earlier rule "a one-point trim adjusts the linear term only".
+     * That default existed to stop one noisy measurement refitting the
+     * curvature -- and scaling both terms does not refit it: their RATIO is unchanged, so the curve moves
+     * without bending. The concern that motivated the default is honoured and the operator now gets the
+     * change they confirmed. The linear form needs no special case:
      * `y = m * f0`, so scaling f0 is already scaling the whole pair. */
     rec.f0 *= factor;
     rec.f1 *= factor;
@@ -388,10 +390,11 @@ bool cal_verify(func_t f, uint8_t range, float measured, float reference, float 
  *
  * WHAT THIS TESTS, AND WHAT IT DELIBERATELY NO LONGER TESTS.
  *
- * It tests the two things that are unambiguous: the record's SIGNATURE, and that both coefficients are
- * FINITE. A cleared signature is what an interrupted write leaves behind, and a NaN or an infinity in a
- * coefficient makes every later reading meaningless -- both really are damage, on any range, for any
- * function, with no judgement required.
+ * It tests the things that are unambiguous: the record's SIGNATURE, that both coefficients are FINITE, and
+ * that the gain is not zero (cal_pair_usable). A cleared signature is what an interrupted write
+ * leaves behind, and a NaN, an infinity or a zero gain makes every later reading meaningless -- all of them
+ * really are damage, on any range, for any function, with no judgement required. A dump of a calibrated meter holds two
+ * zero-gain records (AC V 50 V slow, AC A 500 mA medium) and CHECK reports exactly those two.
  *
  * It used to also test that the gain was "near nominal": a linear gain within a factor of two of unity, or
  * a quadratic linear term within a factor of two with a small curvature term. **That test was wrong.**
@@ -409,11 +412,6 @@ bool cal_verify(func_t f, uint8_t range, float measured, float reference, float 
  *
  * UNVERIFIED: whether the original firmware has any plausibility test of its own -- check: look for a
  * coefficient range test in the loader at 0x0DAA2 and the per-function loaders. The port's was invented. */
-static bool pair_plausible(func_t f, const ee_pair_t *p) {
-    (void)f; /* the test is the same for every function, which is the point */
-    return isfinite(p->f0) && isfinite(p->f1);
-}
-
 /* Short names for the CHECK report. Deliberately NOT called func_name: tables.h already has a
  * func_name[] holding the panel keyword records, and two tables with one name is how the wrong one
  * gets used. These are for a fault message, not for the display. */
@@ -455,7 +453,7 @@ static const char *check_name_for(uint8_t fi, uint8_t range) {
  * Skipping the aliases is exact, which a deduplicating buffer would not have been: there is no bound to
  * reason about and no eviction to get wrong. The functions below are the ones that own what they read. */
 static bool func_owns_its_records(func_t f) {
-    /* Six aliases, not four. `cal_pair_address()` is the authority and it maps:
+    /* Six aliases, not four . `cal_pair_address() is the authority and it maps:
      *
      *     ACDCV -> the DC V records      CONT   -> the OHM X records
      *     ACDCI -> the DC A records      DIODE  -> the OHM X pair of range 4
@@ -466,8 +464,8 @@ static bool func_owns_its_records(func_t f) {
      * AC V record was reported three times -- once as ACV, once as FRE, once as PER -- tripling the count
      * and filling the eight-name list with copies of one fault.
      *
-     * It does not show on a healthy dump, where all 78 MAIN records are valid and finite so CHECK returns
-     * 0 either way. A defect that only appears once something is already wrong is exactly the kind this
+     * It did not show on a dump of a calibrated meter, where the only unusable MAIN records are two zero-gain pairs
+     * (AC V and AC A) and no other record is damaged. A defect that only shows once something is already wrong is exactly the kind this
      * screen must not have: it would mislead at the only moment anyone reads it. */
     return f != FUNC_ACDCV && f != FUNC_ACDCI && f != FUNC_CONT && f != FUNC_DIODE && f != FUNC_FREQ &&
            f != FUNC_PERIOD;
@@ -494,7 +492,7 @@ uint16_t cal_check_all(cal_check_report_fn report) {
                 if (addr == EE_ADDR_NONE) {
                     continue; /* the combination does not exist, which is not damage */
                 }
-                if (!cal_read_pair(addr, &rec) || !pair_plausible(f, &rec)) {
+                if (!cal_read_pair(addr, &rec) || !cal_pair_usable(f, &rec)) {
                     bad++;
                     if (report != NULL) {
                         report(check_name_for(fi, range), addr);

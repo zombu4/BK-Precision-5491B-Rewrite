@@ -138,9 +138,8 @@ static void date_command(uint16_t address, bool write_once) {
 
 /* COUNT INCRement -- a u16 that never wraps (ORIGINAL_BUGS #62).
  *
- * THERE IS NO DECREMENT. The original has one and this firmware refuses it. Counter decrements are
- * among the operations that must never be possible, next to memory wipes and identity rewrites, and for
- * the same reason: the calibration and
+ * THERE IS NO DECREMENT. The original has one and this firmware refuses it . Counter decrements are among the operations that must never be
+ * possible, next to memory wipes and identity rewrites, and for the same reason: the calibration and
  * service counts are the only record of how often this instrument has been adjusted, and nothing else on
  * the meter can contradict a count that has been walked backwards. A meter whose count says 3 when it has
  * been calibrated eleven times is not a meter whose history can be audited.

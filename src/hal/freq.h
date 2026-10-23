@@ -1,16 +1,18 @@
 /* freq.h -- frequency / period counter on Timer1 (ICP1, PD4) and Timer3 (T3, PE6).
- * FROZEN.
  *
  * The overflow weight is 65536, NOT the original's 65535; the software
  * 3000-iteration timeout becomes a real time-based timeout; period = 1/f is guarded against f == 0.
  * This changes readings by about 15 ppm -- a deliberate change.
+ *
+ * The timeout is part of the gate. It is armed by freq_gate_start(), enforced by the Timer1 overflow
+ * interrupt, and adapts to the input: the measurement is abandoned when the gate time plus two periods of the
+ * measured input have passed (see freq.c). Nothing outside this module counts time for the counter.
  */
 #ifndef BK_FREQ_H
 #define BK_FREQ_H
 #include <stdbool.h>
 #include <stdint.h>
 #define FREQ_OVERFLOW_WEIGHT 65536UL
-#define FREQ_GATE_TIMEOUT_MS 3000u
 void freq_init(void);
 void freq_gate_start(void);
 
@@ -21,7 +23,14 @@ void freq_gate_start(void);
  * interrupt live with no one waiting for it, and "harmless because nobody looks" is the kind of state that
  * stops being harmless the moment something else starts looking. */
 void freq_gate_abort(void);
-bool freq_result_ready(void);
-bool freq_read(float *hz, uint16_t timeout_ms);
-bool freq_period_read(float *seconds, uint16_t timeout_ms); /* guarded against zero frequency */
+
+/* Where the armed gate is. RUNNING: keep polling. DONE: freq_read() / freq_period_read() will deliver.
+ * NO_SIGNAL: the deadline passed, or no gate is armed; the caller reads zero. */
+typedef enum { FREQ_GATE_RUNNING = 0, FREQ_GATE_DONE, FREQ_GATE_NO_SIGNAL } freq_gate_t;
+freq_gate_t freq_gate_poll(void);
+
+/* Both consume a finished gate and do not wait. False when the gate has not finished or holds no usable
+ * window. */
+bool freq_read(float *hz);
+bool freq_period_read(float *seconds); /* guarded against zero frequency */
 #endif
