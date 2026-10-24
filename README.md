@@ -83,8 +83,9 @@ Do not change the fuses. Disconnect the programmer and power-cycle the meter; `*
 
 Once this project's boot loader is in the meter (it is part of `5491B-rewrite-full.hex`), the application can be
 replaced over the remote serial port (the USB port on the unit tested) without a programmer. The download itself
-has so far been tested in the simulator only (tests T02-T07, T22-T24). On the meter, this boot loader has been
-checked to start the application; the banner at the serial settings below is tested in the simulator only (T24).
+has so far been tested in the simulator only (tests T02-T07, T22-T24). On the meter, this boot loader starts the
+application, and the arrow-key banner at the serial settings below, followed by the start of the application about
+4 s later, has been checked.
 Hold both horizontal arrow keys while switching the meter on;
 the loader shows a banner and waits about 4 s for ENTER. After ENTER it sends `C` about every 1.36 s: start an
 XMODEM-CRC transfer of `5491B-rewrite-app-xmodem.bin`. The loader's serial link runs at **38461.5 baud, 8 data
