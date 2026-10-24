@@ -3412,6 +3412,50 @@ static result_t test_24(void) {
     return T_PASS;
 }
 
+/* Reads one number of the :SCAL:STD reply: strtod() must consume a non-empty token that has a mantissa and an
+ * exponent (the "%.8e" layout), and the character after it is returned through `next`. */
+static bool std_reply_number(const char *p, const char **next) {
+    char *end;
+
+    (void)strtod(p, &end);
+    if (end == p || end[-1] < '0' || end[-1] > '9') {
+        return false;
+    }
+    bool has_exponent = false;
+
+    for (const char *c = p; c < end; c++) {
+        has_exponent = has_exponent || *c == 'e' || *c == 'E';
+    }
+    *next = end;
+    return has_exponent;
+}
+
+/* 25. :SCAL:STD:DC replies three complete numbers, medium ':' fast ',' slow. A reply buffer that was too small
+ * cut the slow reading off on the meter (src/remote/exec.c query_service()). */
+static result_t test_25(void) {
+    reply_t rep;
+
+    app_open();
+    /* The power-on relay exercise (main.c, about 1.5 s) holds the converter, and a :SCAL:STD sent while it runs
+     * is refused with an error and no reply (exec.c, meas_claim). Let it finish first. */
+    (void)run_for(SEC(3));
+    run_status_t r = host_query(":SCAL:STD:DC", &rep, SEC(120));
+
+    REQUIRE(r == RUN_OK, "no reply to :SCAL:STD:DC: %s", run_text(r));
+    const char *p = rep.text;
+
+    REQUIRE(std_reply_number(p, &p) && *p == ':', "medium reading of \"%s\" is not a complete number before ':'",
+            rep.text);
+    p++;
+    REQUIRE(std_reply_number(p, &p) && *p == ',', "fast reading of \"%s\" is not a complete number before ','",
+            rep.text);
+    p++;
+    REQUIRE(std_reply_number(p, &p) && *p == '\0', "slow reading of \"%s\" is not a complete number at the end",
+            rep.text);
+    info(":SCAL:STD:DC -> \"%s\"", rep.text);
+    return T_PASS;
+}
+
 static const test_t TESTS[] = {
     {1, "boot: no key held, application starts, no banner", test_01},
     {2, "boot: arrows+ENTER, full image over XMODEM-CRC, flash exact, app runs", test_02},
@@ -3437,6 +3481,7 @@ static const test_t TESTS[] = {
     {22, "boot: truncated transfer (trailer claims more than was sent) refused, flag kept, app not run", test_22},
     {23, "boot: complete transfer with a wrong trailer CRC refused with FAIL C, flag kept, app not run", test_23},
     {24, "boot: link is 38461.5 baud (U2X, UBRR1 38), 8 data bits, 1 stop bit, no debug echoes", test_24},
+    {25, "app: :SCAL:STD:DC replies three complete numbers, medium:fast,slow", test_25},
 };
 
 int main(int argc, char **argv) {

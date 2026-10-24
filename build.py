@@ -9,7 +9,9 @@ flags; if they ever disagree the Makefile wins.
     python -I build.py hosttests  the host-side tests
     python -I build.py clean
 
-    --release                     stamp FW_VERSION with today's date (needs avr-gcc 14 or later)
+    python -I build.py --release --release-tag vX.Y.Z image
+                                  a release image; FW_VERSION becomes VerX.Y.Z.<yy>.<mm>.<dd>. Needs
+                                  avr-gcc 14 or later. Without --release-tag a release build refuses to run.
 
 Toolchain. The AVR GNU toolchain is found in the directory named by the environment variable AVR_GCC_BIN,
 or else wherever `avr-gcc` is on PATH. Nothing about its location is built into this file.
@@ -438,22 +440,50 @@ def hosttests_wsl(names):
     return r.returncode
 
 
-def release_version() -> str:
-    """`Ver2.0.<yy>.<mm>.<dd>` from today's date, matching the vendor's shape (see src/version.h).
+RELEASE_TAG = re.compile(r"v(\d{1,3})\.(\d{1,3})\.(\d{1,3})")
 
-    Stamped by --release so that a released firmware never reports a version somebody forgot to edit. A
-    development build keeps the 00.00.00 fallback in version.h, which is deliberately not a plausible date.
+
+def release_version(tag: str) -> str:
+    """`Ver<X>.<Y>.<Z>.<yy>.<mm>.<dd>` from the release tag `vX.Y.Z` and today's date (see src/version.h).
+
+    Stamped by --release so that a released firmware never reports a version somebody forgot to edit. The
+    tag, not the date, tells two releases made on one day apart. A development build keeps the 00.00.00
+    fallback in version.h, which is not a calendar date.
     """
     from datetime import date
 
+    m = RELEASE_TAG.fullmatch(tag)
+    if m is None:
+        raise ValueError(f"release tag {tag!r} is not of the form vX.Y.Z")
     d = date.today()
-    return f"Ver2.0.{d.year % 100:02d}.{d.month:02d}.{d.day:02d}"
+    return f"Ver{m[1]}.{m[2]}.{m[3]}.{d.year % 100:02d}.{d.month:02d}.{d.day:02d}"
 
 
 def main():
     args = [a for a in sys.argv[1:]]
     release = "--release" in args
     args = [a for a in args if a != "--release"]
+
+    release_tag = None
+    for i, a in enumerate(args):
+        if a.startswith("--release-tag="):
+            release_tag = a.split("=", 1)[1]
+            del args[i]
+            break
+        if a == "--release-tag":
+            if i + 1 >= len(args):
+                print("--release-tag needs a value such as v2.0.2")
+                return 2
+            release_tag = args[i + 1]
+            del args[i:i + 2]
+            break
+    if release and release_tag is None:
+        print("--release needs --release-tag vX.Y.Z (the git tag being released)")
+        return 2
+    if release_tag is not None and not release:
+        print("--release-tag is only valid together with --release")
+        return 2
+
     what = args[0] if args else "all"
 
     if what == "hosttests":
@@ -482,14 +512,18 @@ def main():
         if gcc_major() < 14:
             print("a release build needs avr-gcc 14 or later")
             return 2
-        version = release_version()
+        try:
+            version = release_version(release_tag)
+        except ValueError as err:
+            print(err)
+            return 2
         # The quotes are part of the macro VALUE, so the argument is -DFW_VERSION="Ver..." with the
         # double quotes inside it. No shell is involved -- subprocess is given argv directly -- so there is
         # nothing to escape them from, and escaping them would put backslashes into the version string.
         CFLAGS.append(f'-DFW_VERSION="{version}"')
         print(f"release build: FW_VERSION = {version}")
     else:
-        print("development build: FW_VERSION is the fallback in src/version.h (--release stamps the date)")
+        print("development build: FW_VERSION is the fallback in src/version.h (--release --release-tag stamps it)")
 
     app_src, boot_src = sources()
     print(f"compiling {len(app_src)} application and {len(boot_src)} boot-loader files")

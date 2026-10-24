@@ -21,13 +21,14 @@ working, and fixes the defects found in the original firmware.
   `1:` prefixes: [docs/MENU_TEXTS.md](docs/MENU_TEXTS.md).
 - New SYS settings, among them **LINE 50/60 Hz** (the converter integrates over one mains cycle; default 60 Hz)
   and a relay exerciser.
+- `:SYSTem:RELay:STATistics?` reports the last relay exercise's pattern count and duration.
 - The calibration data in EEPROM is read in the same format as the original, so an existing calibration keeps
   working.
 
 ## Status
 
 Runs on one 5491B, the developer's unit, with that unit's original calibration data; bench checks of the
-front panel and the remote interface on it are ongoing. A simulator suite (24 tests, `sim/`, including the boot
+front panel and the remote interface on it are ongoing. A simulator suite (25 tests, `sim/`, including the boot
 loader) runs on every build. No other 5491B has been tested.
 
 ## Release files

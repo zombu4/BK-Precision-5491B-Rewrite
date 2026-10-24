@@ -311,6 +311,9 @@ static bool exercising; /* the exercise owns the front end: no self-calibration 
 static relay_exercise_result_t exercise_result = RLYEX_IDLE;
 static volatile uint16_t exercise_total_ms; /* what is left of the run */
 static volatile uint16_t exercise_hold_ms;  /* what is left of the current pattern's hold */
+static volatile uint32_t exercise_elapsed_ms; /* milliseconds since the first pattern, while timing */
+static volatile bool exercise_timing;         /* true from the first pattern until the run ends */
+static uint16_t exercise_patterns_written;   /* patterns written to the port bits in this run */
 static volatile uint16_t exercise_guard_ms; /* what is left before the input guard must run again */
 
 /* ---- Small helpers ----------------------------------------------------------------------------------- */
@@ -868,6 +871,9 @@ void meas_tick_1ms(void) {
     }
     if (exercise_hold_ms != 0u) {
         exercise_hold_ms--;
+    }
+    if (exercise_timing) {
+        exercise_elapsed_ms++;
     }
     if (exercise_guard_ms != 0u) {
         exercise_guard_ms--;
@@ -1882,8 +1888,13 @@ static void step_gate(void) {
  * 75 ms was chosen from the simulator (sim test 19, converter at 16.658 ms per conversion, 60 Hz). Before the
  * guard was moved off the per-pattern path, one pattern took the guard (7 discards + 2 reads = 9 conversions,
  * 150 ms) plus the 25 ms hold, and the measured rate was 5.50 patterns/s. With a 75 ms step and the guard once
- * per MEAS_GUARD_PERIOD_MS the measured rate is 9.25 patterns/s, 1.68 times the old one; the aim was 1.5 times. */
-#define MEAS_RELAY_STEP_MS 75u
+ * per MEAS_GUARD_PERIOD_MS the measured rate is 9.25 patterns/s, 1.68 times the old one; the aim was 1.5 times.
+ *
+ * Measured on the meter with :SYST:REL:STAT?: the power-on pass wrote 16 patterns in 1345 ms with the
+ * 75 ms step, 84 ms per pattern, so 9 ms per pattern is spent outside the hold. No speed change was noticeable
+ * and about 40 % faster was wanted. With the guard (about 167 ms) once per 800 ms, a 75 ms step gives about
+ * 9.8 patterns/s on the meter; 50 ms gives 800 / 59 = 13.6 patterns per 967 ms, about 14 patterns/s, 1.43 times. */
+#define MEAS_RELAY_STEP_MS 50u
 #define MEAS_RELAY_FULL_MS 60000u /* the menu's exercise */
 #define MEAS_RELAY_BOOT_MS 1500u  /* the quick one at power-on */
 
@@ -1975,6 +1986,7 @@ static void exercise_pattern(uint8_t index, func_t *f, uint8_t *range) {
  * so the next pass reloads its own. The time the front end needs to settle is carried to that pass in
  * restore_discards. A PGA that differs from the calibrated one is picked up by selfcal_wanted(). */
 static void exercise_finish(relay_exercise_result_t result) {
+    exercise_timing = false;
     exercise.active = false;
     exercising = false;
     exercise_result = result;
@@ -2020,6 +2032,8 @@ static void exercise_next(void) {
     }
     exercise_pattern(exercise.pattern, &f, &range);
     (void)fe_apply(primary_fe(f), range);
+    exercise_patterns_written++;
+    exercise_timing = true;
     timer_set(&exercise_hold_ms, MEAS_RELAY_STEP_MS);
     exercise.step = EX_HOLD;
 }
@@ -2107,6 +2121,9 @@ bool meas_relay_exercise_start(bool full) {
         exercise_total_ms = full ? MEAS_RELAY_FULL_MS : MEAS_RELAY_BOOT_MS;
         exercise_hold_ms = 0u;
         exercise_guard_ms = 0u;
+        exercise_elapsed_ms = 0u;
+        exercise_timing = false;
+        exercise_patterns_written = 0u;
     }
     g_state.reading.valid = false;
     return true;
@@ -2121,6 +2138,13 @@ void meas_relay_exercise_abort(void) {
 
 relay_exercise_result_t meas_relay_exercise_result(void) {
     return exercise_result;
+}
+
+void meas_relay_exercise_stats(uint16_t *patterns, uint32_t *elapsed_ms) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        *patterns = exercise_patterns_written;
+        *elapsed_ms = exercise_elapsed_ms;
+    }
 }
 
 /* Whole seconds left, rounded up, for the countdown on the display. 0 when nothing is running. */

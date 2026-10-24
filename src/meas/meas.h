@@ -161,6 +161,8 @@ void meas_hold_release(void);
 /* `full` selects the 60 s menu sequence; false is the ~1.5 s power-on pass. */
 bool meas_relay_exercise_start(bool full);
 void meas_relay_exercise_abort(void);
+/* Patterns written and milliseconds elapsed in the last (or the running) relay exercise. */
+void meas_relay_exercise_stats(uint16_t *patterns, uint32_t *elapsed_ms);
 uint8_t meas_relay_exercise_seconds_left(void);
 
 typedef enum {

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds the simavr harness and runs all 24 tests. Exit status is non-zero if any test fails. Extra
+# Builds the simavr harness and runs all 25 tests. Exit status is non-zero if any test fails. Extra
 # arguments go to the harness (for example --only 8).
 #
 # Prerequisites:

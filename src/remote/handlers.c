@@ -993,6 +993,12 @@ static void setting_set(bool *field, bool on) {
 #define INFO_FIELD_MAX 20u
 #define INFO_ERASED_COUNT 0xFFFFu
 
+/* The longest line: the version, the 20-byte serial, two 8-byte dates, three counts of up to five digits and
+ * six commas. The version is bounded by the build, so a longer FW_VERSION is a compile error rather than a
+ * cut-off reply. */
+_Static_assert(sizeof(FW_VERSION) + INFO_FIELD_MAX + 2u * 8u + 3u * 5u + 6u <= INFO_LINE_MAX,
+               "the :SYSTem:INFO? line holds the longest version string");
+
 typedef struct {
     char text[INFO_LINE_MAX];
     size_t length;
@@ -1024,6 +1030,35 @@ static void info_eeprom_text(info_line_t *line, uint16_t address, uint8_t count)
     info_text(line, raw, count);
 }
 
+/* A stored date is shown only when it has the shape of the production date the vendor writes, "dd/mm/yy":
+ * digits in all but cells 2 and 5, which are slashes. Anything else (a vendor unit holds "5///5/5/" in
+ * both :THID dates, bytes 35 2F 2F 2F 35 2F 35 2F at 0x0A1C and 0x0A2D; an erased field is eight 0xFF) is
+ * a date that was never set, and the vendor never gave that case a text of its own: its :THID:...:DATE?
+ * reply sends the stored bytes up to the first zero (reply routine 0x1E48), and its unset product serial
+ * reads as an empty reply. The field is therefore left empty, which keeps the seven-field layout. The
+ * :THID:...:DATE? queries still send the stored bytes, as the vendor does. */
+#define INFO_DATE_LENGTH 8u
+
+static bool info_date_shaped(const char *raw) {
+    for (uint8_t i = 0u; i < INFO_DATE_LENGTH; i++) {
+        const bool slash_cell = (i == 2u || i == 5u);
+
+        if (slash_cell ? (raw[i] != '/') : (raw[i] < '0' || raw[i] > '9')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void info_eeprom_date(info_line_t *line, uint16_t address) {
+    char raw[INFO_DATE_LENGTH];
+
+    ee_read_block(address, raw, INFO_DATE_LENGTH);
+    if (info_date_shaped(raw)) {
+        info_text(line, raw, INFO_DATE_LENGTH);
+    }
+}
+
 static void info_count(info_line_t *line, uint16_t value) {
     char digits[8];
     size_t length = fmt_int(digits, sizeof digits, (int32_t)value);
@@ -1044,21 +1079,20 @@ static uint16_t info_stored_count(uint16_t address) {
 
 static void reply_info(void) {
     static const char version_flash[] PROGMEM = FW_VERSION;
-    char version[INFO_FIELD_MAX];
+    char version[sizeof version_flash];
     info_line_t line = {.length = 0u};
 
-    strncpy_P(version, version_flash, sizeof version - 1u);
-    version[sizeof version - 1u] = '\0';
+    memcpy_P(version, version_flash, sizeof version);
 
     info_text(&line, version, (uint8_t)sizeof version);
     info_char(&line, ',');
     info_eeprom_text(&line, EE_ID_SERIAL, INFO_FIELD_MAX);
     info_char(&line, ',');
-    info_eeprom_text(&line, EE_THID_CAL_DATE, 8u);
+    info_eeprom_date(&line, EE_THID_CAL_DATE);
     info_char(&line, ',');
     info_count(&line, info_stored_count(EE_THID_CAL_COUNT));
     info_char(&line, ',');
-    info_eeprom_text(&line, EE_THID_PROD_DATE, 8u);
+    info_eeprom_date(&line, EE_THID_PROD_DATE);
     info_char(&line, ',');
     info_count(&line, main_power_on_hours());
     info_char(&line, ',');
@@ -1067,7 +1101,59 @@ static void reply_info(void) {
     remote_reply(line.text);
 }
 
-/* :SYSTem:ERRor?, :SYSTem:BEEPer ON|OFF|?, :SYSTem:INFO? */
+/* Writes `value` in decimal at dst and returns the digit count. Ten digits hold any uint32_t. */
+static size_t unsigned_text(char *dst, uint32_t value) {
+    char digits[10];
+    size_t count = 0u;
+
+    do {
+        digits[count++] = (char)('0' + (uint8_t)(value % 10uL));
+        value /= 10uL;
+    } while (value != 0uL);
+    for (size_t i = 0u; i < count; i++) {
+        dst[i] = digits[count - 1u - i];
+    }
+    return count;
+}
+
+/* :SYSTem:RELay:STATistics? (PROTOCOL_CHANGES, relay exercise report) -- "<patterns>,<elapsed_ms>": the
+ * relay patterns written and the milliseconds elapsed in the last relay exercise, or in the one that is
+ * running. Open, not protected: it reads two counters and changes nothing. The line holds a five-digit
+ * count, a comma and a ten-digit time, 16 characters and the terminator. */
+static void reply_relay_statistics(void) {
+    char text[5u + 1u + 10u + 1u];
+    uint16_t patterns;
+    uint32_t elapsed_ms;
+    size_t length;
+
+    meas_relay_exercise_stats(&patterns, &elapsed_ms);
+    length = unsigned_text(text, patterns);
+    text[length++] = ',';
+    length += unsigned_text(text + length, elapsed_ms);
+    text[length] = '\0';
+    remote_reply(text);
+}
+
+/* :SYSTem:RELay:STATistics? -- the path is consumed here, as :THID does for its own. */
+static void system_relay(void) {
+    if (!scpi_next_is_colon()) {
+        scpi_fail_syntax();
+        return;
+    }
+    scpi_next_token();
+    if (!KW("statistics") && !KW("stat")) {
+        scpi_fail_bad_command();
+        return;
+    }
+    scpi_next_token();
+    if (scpi_token_is_query()) {
+        reply_relay_statistics();
+    } else {
+        scpi_fail_bad_command();
+    }
+}
+
+/* :SYSTem:ERRor?, :SYSTem:BEEPer ON|OFF|?, :SYSTem:INFO?, :SYSTem:RELay:STATistics? */
 void scpi_cmd_system(void) {
     if (scpi_depth() > 1u || !scpi_next_is_colon()) {
         scpi_fail_bad_command();
@@ -1091,6 +1177,8 @@ void scpi_cmd_system(void) {
         } else {
             scpi_fail_bad_command();
         }
+    } else if (KW("relay") || KW("rel")) {
+        system_relay();
     } else if (KW("beeper") || KW("beep")) {
         switch (scpi_arg_bool()) {
         case SCPI_BOOL_ON:

@@ -1,0 +1,15 @@
+log10f inputs 2100
+  |ulp| distance histogram (value: count): {0: 1342, 1: 742, 2: 15, 3: 1}
+  max |ulp| to correctly rounded: 3 at x=0.7523816823959351 got=-0.1235618069767952 correct=-0.1235617846250534
+  max |err| vs exact in ulp: 2.7624 at x=0.7523816823959351 got=-0.1235618069767952 correct=-0.1235617846250534
+  max abs err: 1.091457e-6 at x=1.1508812791660716e-09 got=-8.938970565795898
+  max rel err: 1.665672e-7 at x=0.7523816823959351 got=-0.1235618069767952
+sqrtf inputs 2042
+  |ulp| distance histogram (value: count): {0: 2042}
+  max |ulp| to correctly rounded: 0 at x=9.999999960041972e-13 got=9.999999974752427e-07 correct=9.999999974752427e-07
+  max |err| vs exact in ulp: 0.5000 at x=0.9999999403953552 got=0.9999999403953552 correct=0.9999999403953552
+  max abs err: 6.067378e-5 at x=2000000.0 got=1414.213623046875
+  max rel err: 5.960464e-8 at x=1.0000001192092896 got=1.0
+dB  (20*log10)  max abs error dB : 2.182913e-5
+dBm (10*log10)  max abs error dB : 1.091457e-5
+AC+DC sqrt      max rel error    : 5.960464e-8

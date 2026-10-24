@@ -47,14 +47,12 @@
 #define IDN_MODEL_BYTES 28u  /* EE_ID_MODEL */
 #define IDN_SERIAL_BYTES 20u /* EE_ID_SERIAL */
 
-/* The firmware version that *IDN? reports: "Ver2.0.<yy>.<mm>.<dd>", distinct from the vendor's
- * "Ver1.4.14.06.18". It is a constant of the firmware, not read from EEPROM 0x0830 (ORIGINAL_BUGS #12), so
- * an edit of that text has no effect. The release stamp is set by the build (-DFW_VERSION=...).
- * UNVERIFIED: the date below is the date this file was written, not a release date. No header declares the
- * version for REVISION in the menu either; the release process must set it and decide where it lives. */
+/* The firmware version that *IDN? reports: "Ver<X>.<Y>.<Z>.<yy>.<mm>.<dd>", distinct from the
+ * vendor's "Ver1.4.14.06.18". It is a constant of the firmware, not read from EEPROM 0x0830 (ORIGINAL_BUGS
+ * #12), so an edit of that text has no effect. The release stamp is set by the build (-DFW_VERSION=...). */
 
 /* FW_VERSION comes from ../version.h, so the *IDN? reply and the SYS REVISION page cannot
- * drift apart and a release can stamp it from the build. */
+ * drift apart and a release can stamp it from the build. The *IDN? line below is sized from it. */
 static const char firmware_version[] PROGMEM = FW_VERSION;
 
 /* ---- Shared pieces ------------------------------------------------------------------------------------- */

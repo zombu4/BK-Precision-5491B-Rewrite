@@ -1140,19 +1140,28 @@ typedef enum { VERIFY_PAGE_RESULT, VERIFY_PAGE_ERROR, VERIFY_PAGES } verify_page
 
 static const char firmware_version[] PROGMEM = FW_VERSION;
 
-/* The firmware version, "Ver2.0.26.10.22", without the lower-case word the display cannot draw: "V2.0.26.10.22"
- * is nine cells, the width of the line. Shown by INFO page 1 and by SYS item 6, REVISION: the original's
- * REVISION screen printed the EEPROM model name and the constant "001" and never a version (0xEDF6-0xEE22,
- * ORIGINAL_BUGS 92). */
+/* The firmware release, "VerX.Y.Z.yy.mm.dd" shown as "VX.Y.Z": the word "Ver" has lower-case letters the display
+ * cannot draw, and the whole string with its date is ten cells on a nine-cell line, so the page stops at the
+ * third '.' (the date stays in *IDN? and :SYST:INFO?). Shown by INFO page 1 and by SYS item 6, REVISION: the
+ * original's REVISION screen printed the EEPROM model name and the constant "001" and never a version
+ * (0xEDF6-0xEE22, ORIGINAL_BUGS 92). */
 static void render_version(line_t *l) {
     const char *version = firmware_version;
+    uint8_t dots = 0u;
+    char c;
 
     if (pgm_read_byte(version) == 'V' && pgm_read_byte(version + 1) == 'e' &&
         pgm_read_byte(version + 2) == 'r') {
         version += 3;
     }
     line_putc(l, 'V');
-    line_puts_P(l, version);
+    while ((c = (char)pgm_read_byte(version)) != '\0') {
+        if (c == '.' && ++dots == 3u) {
+            break;
+        }
+        line_putc(l, c);
+        version++;
+    }
 }
 
 _Static_assert(LT_LBL_POWER_UPS - LT_LBL_VERSION == INFO_POWER_UPS - INFO_VERSION,
