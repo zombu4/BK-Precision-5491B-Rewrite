@@ -65,6 +65,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <util/atomic.h>
+#include <util/delay.h>
 
 #include "../board.h"
 #include "../eeprom_map.h"
@@ -559,6 +560,26 @@ static void fe_ohm_bits_off(void) {
     BIT_CLR(PORTE, FE_E_50M_PATH);
 }
 
+/* ORIGINAL_BUGS #101. The original's ohm and diode routines switch the ohm source on (PA2, PB6) in the middle of
+ * the change, before the high-voltage input path (PA1) is switched off. This writes every other bit first and
+ * the source last, and when the source was off -- every entry from another function, since fe_ohm_bits_off()
+ * -- it waits FE_SOURCE_OPEN_MS before switching it on, so the contacts that the change opens have opened. During
+ * the wait the front end is the new function with its source off. A range change inside ohms finds the source
+ * already on and does not wait.
+ * The front-end relays are Panasonic TQ2-5V: the marking on the board reads ATQ209, which Panasonic's product page
+ * maps to TQ2-5V (single side stable, 5 V DC). Distributor listings give a 3 ms release time; 20 ms is more than six
+ * times that. UNVERIFIED: Panasonic's own maximum release time -- check: the release-time row of the TQ relays
+ * datasheet. */
+#define FE_SOURCE_OPEN_MS 20u
+
+static void fe_ohm_source_on(void) {
+    if (!bit_is_set(PORTA, FE_A_OHM_SRC_EN) || !bit_is_set(PORTB, FE_B_OHM_SRC)) {
+        _delay_ms(FE_SOURCE_OPEN_MS);
+    }
+    BIT_SET(PORTA, FE_A_OHM_SRC_EN);
+    BIT_SET(PORTB, FE_B_OHM_SRC);
+}
+
 /* 0x6616. PA5 is not written by the original here; the port drives PA5 = 0, the
  * power-up state, so DCV no longer inherits whatever the previous function left. The write sits after PA6,
  * before the first of the original's remaining bits. */
@@ -730,10 +751,8 @@ static uint8_t fe_ohm(uint8_t r) {
     BIT_CLR(PORTA, FE_A_VI_SELECT);
     BIT_CLR(PORTC, FE_C_SHUNT_5MA);
     BIT_SET(PORTB, FE_B_AC_PATH);
-    BIT_SET(PORTA, FE_A_OHM_SRC_EN);
     BIT_CLR(PORTA, FE_A_HV_PATH);
     BIT_CLR(PORTG, PG2);
-    BIT_SET(PORTB, FE_B_OHM_SRC);
     if (r == 0u) {
         BIT_SET(PORTE, FE_E_50M_PATH);
         BIT_CLR(PORTD, FE_D_OHM_PATH);
@@ -774,6 +793,7 @@ static uint8_t fe_ohm(uint8_t r) {
         set_pga(3u);
         break;
     }
+    fe_ohm_source_on();
     return MEAS_SETTLE_DEFAULT;
 }
 
@@ -784,17 +804,16 @@ static uint8_t fe_diode(void) {
     BIT_SET(PORTA, FE_A_MODE_I_OHM);
     BIT_CLR(PORTA, FE_A_VI_SELECT);
     BIT_CLR(PORTC, FE_C_SHUNT_5MA);
-    BIT_SET(PORTA, FE_A_OHM_SRC_EN);
     BIT_SET(PORTB, FE_B_AC_PATH);
     BIT_CLR(PORTA, FE_A_HV_PATH);
     BIT_CLR(PORTG, PG2);
-    BIT_SET(PORTB, FE_B_OHM_SRC);
     BIT_CLR(PORTE, FE_E_50M_PATH);
     BIT_SET(PORTD, FE_D_OHM_PATH);
     BIT_CLR(PORTA, FE_A_50M_RANGE);
     BIT_CLR(PORTF, FE_F_LADDER1);
     BIT_CLR(PORTA, FE_A_LADDER0);
     set_pga(0u);
+    fe_ohm_source_on();
     return MEAS_SETTLE_DEFAULT;
 }
 
