@@ -566,10 +566,11 @@ static void fe_ohm_bits_off(void) {
  * -- it waits FE_SOURCE_OPEN_MS before switching it on, so the contacts that the change opens have opened. During
  * the wait the front end is the new function with its source off. A range change inside ohms finds the source
  * already on and does not wait.
- * The front-end relays are Panasonic TQ2-5V: the marking on the board reads ATQ209, which Panasonic's product page
- * maps to TQ2-5V (single side stable, 5 V DC). Distributor listings give a 3 ms release time; 20 ms is more than six
- * times that. UNVERIFIED: Panasonic's own maximum release time -- check: the release-time row of the TQ relays
- * datasheet. */
+ * The front-end relays carry the marking "TQ2-5 ATQ209", Panasonic's TQ2-5V part number, but they are not
+ * Panasonic parts (inspected on the board); their maker and datasheet are unknown. For comparison only, distributor
+ * listings give the Panasonic TQ2-5V a 3 ms release time.
+ * UNVERIFIED: that 20 ms covers the release time of these relays -- no datasheet exists for them; 20 ms is more
+ * than six times the genuine part's listed figure. */
 #define FE_SOURCE_OPEN_MS 20u
 
 static void fe_ohm_source_on(void) {
