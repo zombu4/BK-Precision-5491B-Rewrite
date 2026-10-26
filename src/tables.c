@@ -322,12 +322,6 @@ static const char w_500kohm[] TBL_FLASH = "500kohm";
 static const char w_50kohm[] TBL_FLASH = "50kohm";
 static const char w_5kohm[] TBL_FLASH = "5kohm";
 static const char w_500ohm[] TBL_FLASH = "500ohm";
-static const char w_10[] TBL_FLASH = "10";
-static const char w_100[] TBL_FLASH = "100";
-static const char w_1[] TBL_FLASH = "1";
-static const char w_10ua[] TBL_FLASH = "10ua";
-static const char w_100ua[] TBL_FLASH = "100ua";
-static const char w_1ma[] TBL_FLASH = "1ma";
 static const char w_def[] TBL_FLASH = "def";
 static const char w_default[] TBL_FLASH = "default";
 static const char w_min[] TBL_FLASH = "min";
@@ -399,10 +393,9 @@ const range_word_t range_word[] TBL_FLASH = {
     {w_def, FUNC_CONT, 0},       {w_default, FUNC_CONT, 0},   {w_min, FUNC_CONT, 5},
     {w_minimum, FUNC_CONT, 5},   {w_max, FUNC_CONT, 0},       {w_maximum, FUNC_CONT, 0},
 
-    {w_10, FUNC_DIODE, 0},       {w_100, FUNC_DIODE, 1},      {w_1, FUNC_DIODE, 2},
-    {w_10ua, FUNC_DIODE, 0},     {w_100ua, FUNC_DIODE, 1},    {w_1ma, FUNC_DIODE, 2},
-    {w_def, FUNC_DIODE, 2},      {w_default, FUNC_DIODE, 2},  {w_min, FUNC_DIODE, 0},
-    {w_minimum, FUNC_DIODE, 0},  {w_max, FUNC_DIODE, 2},      {w_maximum, FUNC_DIODE, 2},
+    /* No FUNC_DIODE rows (ORIGINAL_BUGS #44): the original kept a diode spelling table (flash 0x1A9D: 10, 100, 1 /
+     * 10ua, 100ua, 1ma) but its diode front end (0x6A40) has no range dependence and no bit selects a test
+     * current, so no range exists to name. */
 
     {w_750, FUNC_ACDCV, 0},      {w_500, FUNC_ACDCV, 1},      {w_50, FUNC_ACDCV, 2},
     {w_5, FUNC_ACDCV, 3},        {w_0_5, FUNC_ACDCV, 4},      {w_750v, FUNC_ACDCV, 0},
@@ -418,7 +411,7 @@ const range_word_t range_word[] TBL_FLASH = {
     {w_min, FUNC_ACDCI, 4},      {w_minimum, FUNC_ACDCI, 4},  {w_max, FUNC_ACDCI, 0},
     {w_maximum, FUNC_ACDCI, 0},
 };
-const uint8_t range_word_count = 176;
+const uint8_t range_word_count = 164;
 
 /* ---- Function and second-display name records: flash 0x0787-0x0933, 11-byte {name[10], index} ---------- */
 

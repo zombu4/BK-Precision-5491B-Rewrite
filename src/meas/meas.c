@@ -548,6 +548,17 @@ static void acv_range_block(uint8_t r) {
     }
 }
 
+/* ORIGINAL_BUGS #103. The ohm and diode routines set PA2, PB6, PD5 and PE2. The original clears PA2, PD5 and PE2
+ * only in DC V (0x6616) and PB6 nowhere, so after an ohm reading AC V, DC I and AC I ran with the ohm bits still
+ * set. Every non-ohm routine calls this, which gives each function the state it has when ohms was never used:
+ * PORTB powers up 0x9F (PB6 = 0, board.h BOARD_PORTB) and the power-up DC V clears PA2, PD5 and PE2. */
+static void fe_ohm_bits_off(void) {
+    BIT_CLR(PORTA, FE_A_OHM_SRC_EN);
+    BIT_CLR(PORTB, FE_B_OHM_SRC);
+    BIT_CLR(PORTD, FE_D_OHM_PATH);
+    BIT_CLR(PORTE, FE_E_50M_PATH);
+}
+
 /* 0x6616. PA5 is not written by the original here; the port drives PA5 = 0, the
  * power-up state, so DCV no longer inherits whatever the previous function left. The write sits after PA6,
  * before the first of the original's remaining bits. */
@@ -557,9 +568,7 @@ static uint8_t fe_dcv(uint8_t r) {
     BIT_CLR(PORTA, FE_A_MODE_I_OHM);
     BIT_CLR(PORTC, FE_C_SHUNT_5MA);
     BIT_CLR(PORTB, FE_B_AC_PATH);
-    BIT_CLR(PORTA, FE_A_OHM_SRC_EN);
-    BIT_CLR(PORTD, FE_D_OHM_PATH);
-    BIT_CLR(PORTE, FE_E_50M_PATH);
+    fe_ohm_bits_off();
     if (r < 4u) {
         adc_write_register(ADC_REG_MUX, 0x03u);
         BIT_SET(PORTA, FE_A_ATTEN);
@@ -621,6 +630,7 @@ static uint8_t fe_acv_full(uint8_t r) {
     BIT_SET(PORTB, FE_B_AC_PATH);
     BIT_PUT(PORTC, FE_C_ACV_RANGE_HI, r < 3u);
     BIT_CLR(PORTG, FE_G_ACI_GAIN);
+    fe_ohm_bits_off();
     acv_range_block(r);
     return MEAS_SETTLE_DEFAULT;
 }
@@ -636,6 +646,7 @@ static uint8_t fe_dci(uint8_t r) {
     BIT_SET(PORTA, FE_A_VI_SELECT);
     BIT_CLR(PORTB, FE_B_AC_PATH);
     BIT_SET(PORTF, FE_F_I_DC);
+    fe_ohm_bits_off();
     switch (r) {
     case 0:
     case 1:
@@ -679,6 +690,7 @@ static uint8_t fe_aci(uint8_t r) {
     BIT_CLR(PORTF, FE_F_I_DC);
     BIT_CLR(PORTB, FE_B_ACV_ATTEN);
     BIT_CLR(PORTG, FE_G_ACV_750);
+    fe_ohm_bits_off();
     switch (r) {
     case 0:
     case 1:

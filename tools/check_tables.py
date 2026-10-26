@@ -344,7 +344,7 @@ RANGE_SOURCES = {
     "FUNC_OHM": (0x1911, 19),
     "FUNC_CONT": (0x1911, 19),
     "FUNC_ACDCV": (0x19E2, 17),
-    "FUNC_DIODE": (0x1A9D, 13),
+    # FUNC_DIODE (0x1A9D, 13) is deliberately not ported: ORIGINAL_BUGS #44, see tables.c.
 }
 
 
