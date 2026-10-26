@@ -2815,6 +2815,9 @@ static void page_key(uint8_t key) {
     case KEY_DOWN:
         back_to_items();
         break;
+    case KEY_MENU:
+        menu_close(); /* decision 2026-10-26: plain ESC leaves the menu; the original needed SHIFT+ESC */
+        break;
     default:
         break;
     }
@@ -2846,6 +2849,9 @@ static void item_key(uint8_t key) {
     case KEY_RIGHT:
         *item = (*item + 1u >= page.count) ? 0u : (uint8_t)(*item + 1u);
         redraw();
+        break;
+    case KEY_MENU:
+        menu_close(); /* plain ESC leaves the menu, as on the page level; inside an editor ESC cancels the edit */
         break;
     default:
         break;
