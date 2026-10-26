@@ -619,11 +619,16 @@ void keys_ref_confirmed(void) {
 
 /* The one key that works in remote is SHIFT, as LOCAL (0xDBA6-0xDBBC), unless the local lockout is set. It
  * leaves remote (0xFAD0) and also turns the display back on (0xFAE2 sets RAM 0x0F61 bit 2), which is how the
- * panel comes back after :DISPlay OFF. */
+ * panel comes back after :DISPlay OFF.
+ *
+ * Decision 2026-10-26: the same press also arms SHIFT. The original used the press up as LOCAL only, so after
+ * any remote command SHIFT + a key needed two tries (SHIFT + MENU did nothing the first time on the meter). */
 static void key_in_remote(uint8_t key) {
     if (!g_state.local_lockout && key == KEY_SHIFT) {
         g_state.display_enabled = true;
         remote_go_local();
+        g_state.shift_active = true;
+        display_annunciators();
     }
 }
 
